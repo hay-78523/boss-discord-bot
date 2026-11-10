@@ -562,6 +562,26 @@ async def start_keep_alive_server() -> None:
         except Exception:
             pass
 
+    # Tự động tự ping chính mình mỗi 10 phút trên Render để khỏi cần dùng UptimeRobot
+    render_url = (
+        os.getenv("RENDER_EXTERNAL_URL", "https://boss-discord-bot-nubb.onrender.com").rstrip("/")
+        + "/health"
+    )
+
+    async def _self_ping_loop() -> None:
+        await asyncio.sleep(60)
+        while True:
+            try:
+                timeout = aiohttp.ClientTimeout(total=10)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(render_url) as resp:
+                        logger.debug("Self-ping %s -> %s", render_url, resp.status)
+            except Exception as exc:
+                logger.debug("Self-ping tạm bỏ qua: %s", exc)
+            await asyncio.sleep(600)  # 10 phút ping 1 lần (trước ngưỡng 15 phút của Render)
+
+    asyncio.create_task(_self_ping_loop())
+
 
 class DiscordAIBot(commands.Bot):
     def __init__(self) -> None:
