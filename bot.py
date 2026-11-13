@@ -80,6 +80,7 @@ Khi Sếp Phát (hoặc VIP) ra lệnh bằng lời nói tự nhiên trong tin n
 - Hẹn giờ nhắc việc sau X phút: `<ACTION>{"type": "remind", "minutes": 10, "task": "Nội dung cần nhắc"}</ACTION>`
 - Tạo bảng bình chọn (vote/poll): `<ACTION>{"type": "poll", "question": "Chủ đề vote", "options": ["Lựa chọn 1", "Lựa chọn 2"]}</ACTION>`
 - Xoá trí nhớ / tẩy não cuộc trò chuyện: `<ACTION>{"type": "reset_memory"}</ACTION>`
+- Giao task / giao việc / nhắc thành viên nhận task: Khi Sếp Phát (hoặc VIP) muốn giao việc cho ai đó (ví dụ: "giao cho @tênNgười viết UI", "nhắc @tênNgười làm report", "assign @tên task XYZ deadline thứ 6"...) -> gắn `<ACTION>{"type": "assign_task", "task": "Mô tả nội dung task cần làm", "deadline": "Thời hạn nếu có (optional)"}</ACTION>`. Hệ thống sẽ tự động tag (mention) người nhận bằng embed đẹp có nội dung task, deadline, reaction ✅🔄 cho người nhận xác nhận. Sếp Phát CẦN tag @người_nhận trong tin nhắn để hệ thống biết giao cho ai.
 - [LỆNH NGHE LỜI SẾP - TẮT TỰ ĐỘNG REP / IM LẶNG / KHI NÀO GỌI MỚI THƯA]: Khi Sếp Phát bảo mày im lặng, trật tự, bớt nói, đừng tự động rep nữa, khi nào gọi tên mới trả lời, để Sếp bàn việc... -> gắn `<ACTION>{"type": "quiet_mode", "scope": "channel"}</ACTION>` (hoặc `"scope": "all"` nếu Sếp bảo ở mọi kênh/tất cả các kênh).
 - [LỆNH NGHE LỜI SẾP - BẬT LẠI TỰ ĐỘNG REP / CHO PHÉP NÓI TỰ DO]: Khi Sếp Phát cho phép mày nói chuyện tự do lại, bật auto rep, vào chém gió tiếp... -> gắn `<ACTION>{"type": "talk_mode", "scope": "channel"}</ACTION>` (hoặc `"scope": "all"` nếu Sếp bảo ở mọi kênh).
 - [BIẾT ĐIỀU KHÔNG CẦN REP]: Nếu Sếp Phát dặn "khỏi rep câu này", "nghe thôi đừng trả lời", HOẶC tin nhắn của Sếp chỉ là một câu nói chuyện riêng với người khác / câu cảm thán ngắn mà không hỏi hay sai khiến gì mày -> hãy trả về ĐÚNG 1 từ `<NO_REPLY>` để hệ thống chỉ thả reaction 🫡 xác nhận đã nghe chứ không nhắn tin làm phiền Sếp!
@@ -1271,6 +1272,47 @@ async def execute_natural_action(
         config.muted_channels.discard(message.channel.id)
         config.save_state()
         return "🔥 **[Hệ thống]:** Đã bật lại chế độ **Tự động trò chuyện (Auto-Chat)** tại kênh này!"
+    if action_type == "assign_task":
+        # Giao task cho thành viên — Sếp Phát hoặc VIP đều được dùng
+        task_desc = str(action_data.get("task", "")).strip()
+        deadline = str(action_data.get("deadline", "")).strip()
+        if not task_desc:
+            return "⚠️ *(Chưa có nội dung task để giao. Sếp mô tả task cần làm nhé!)*"
+
+        # Hỗ trợ giao cho nhiều người (mentions trong tin nhắn)
+        targets: List[discord.Member] = []
+        if message.mentions:
+            targets = [m for m in message.mentions if not m.bot]
+        elif target_member:
+            targets = [target_member]
+
+        if not targets:
+            return "⚠️ *(Sếp tag (mention @) người nhận task nhé, em không biết giao cho ai!)*"
+
+        # Build thông báo task
+        mention_str = " ".join(m.mention for m in targets)
+        deadline_line = f"\n⏰ **Deadline:** {deadline}" if deadline else ""
+        task_embed = discord.Embed(
+            title="📋 TASK MỚI ĐƯỢC GIAO!",
+            description=(
+                f"**Nội dung:** {task_desc}{deadline_line}\n\n"
+                f"👤 **Người giao:** {message.author.mention}\n"
+                f"🎯 **Người nhận:** {mention_str}"
+            ),
+            color=discord.Color.orange(),
+        )
+        task_embed.set_footer(
+            text=f"Giao bởi {message.author.display_name} • Hoàn thành task rồi react ✅ nhé!"
+        )
+        task_msg = await message.channel.send(
+            content=f"📣 Ê {mention_str} — có task mới nè, đọc kỹ rồi triển nhanh! 🔥",
+            embed=task_embed,
+        )
+        await task_msg.add_reaction("✅")
+        await task_msg.add_reaction("🔄")
+
+        names = ", ".join(f"**{m.display_name}**" for m in targets)
+        return f"📋 **[Hệ thống]:** Đã giao task và tag {names} thành công!"
 
     return None
 
