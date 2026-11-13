@@ -1621,7 +1621,8 @@ async def on_message(message: discord.Message) -> None:
                 except Exception as act_exc:
                     logger.warning("Không thực thi được ACTION JSON: %s", act_exc)
 
-            if action_status_note:
+            if action_status_note and action_status_note.startswith("⚠️"):
+                # Chỉ hiện khi LỖI — thành công thì ngầm, AI đã rep tự nhiên rồi
                 ai_reply = f"{ai_reply}\n\n{action_status_note}".strip()
 
             history_user_entry = full_user_prompt
