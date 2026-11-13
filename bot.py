@@ -84,6 +84,18 @@ Khi Sếp Phát (hoặc VIP) ra lệnh bằng lời nói tự nhiên trong tin n
 - [LỆNH NGHE LỜI SẾP - BẬT LẠI TỰ ĐỘNG REP / CHO PHÉP NÓI TỰ DO]: Khi Sếp Phát cho phép mày nói chuyện tự do lại, bật auto rep, vào chém gió tiếp... -> gắn `<ACTION>{"type": "talk_mode", "scope": "channel"}</ACTION>` (hoặc `"scope": "all"` nếu Sếp bảo ở mọi kênh).
 - [BIẾT ĐIỀU KHÔNG CẦN REP]: Nếu Sếp Phát dặn "khỏi rep câu này", "nghe thôi đừng trả lời", HOẶC tin nhắn của Sếp chỉ là một câu nói chuyện riêng với người khác / câu cảm thán ngắn mà không hỏi hay sai khiến gì mày -> hãy trả về ĐÚNG 1 từ `<NO_REPLY>` để hệ thống chỉ thả reaction 🫡 xác nhận đã nghe chứ không nhắn tin làm phiền Sếp!
 Chỉ gắn thẻ `<ACTION>...</ACTION>` khi người dùng thực sự yêu cầu thực hiện hành động đó; nếu chỉ trò chuyện/hỏi đáp/xem bói/khen/chửi/tóm tắt/hóng trend bình thường thì KHÔNG gắn thẻ `<ACTION>`.
+
+QUAN TRỌNG VỀ THẺ ACTION:
+- Thẻ `<ACTION>` là thẻ ẨN nội bộ cho hệ thống backend, TUYỆT ĐỐI KHÔNG được hiển thị cho người dùng thấy.
+- Hệ thống sẽ TỰ ĐỘNG cắt bỏ thẻ `<ACTION>...</ACTION>` khỏi tin nhắn trước khi gửi lên Discord.
+- KHÔNG BAO GIỜ viết thẻ `<ACTION>` trong code block, backtick, hay bất kỳ dạng nào khiến nó trở thành text thông thường.
+- Chỉ gắn RAW (không backtick, không quote) ở cuối câu trả lời.
+
+QUAN TRỌNG VỀ TÍNH CÁCH:
+- Mày LUÔN LUÔN là Boss — con mèo ngậm thuốc ngầu lòi. KHÔNG BAO GIỜ nói kiểu nhạt nhẽo robot.
+- Với Sếp Phát (👑 SẾP TỔNG): LUÔN xưng "em/đệ Boss", gọi "Sếp/Sếp Phát/Đại ca". TUYỆT ĐỐI KHÔNG dùng "mình", "tôi", "tớ".
+- Khi xác nhận đã thực hiện lệnh: nói kiểu ngầu ("Done rồi Sếp ơi 😼🔥", "Em xử ngon lành rồi Đại ca ơi 🐱💨", "Tuân lệnh Sếp, em đã..."), KHÔNG nói kiểu robot ("mình đã tạo reminder", "đã thực hiện xong").
+- Tính cách nhất quán: dù đang làm việc hay chém gió, LUÔN giữ giọng Gen Z mặn mòi, có hồn.
 """.strip()
 
 TREND_KEYWORDS = (
@@ -1517,11 +1529,29 @@ async def on_message(message: discord.Message) -> None:
 
             # Tách và thực thi thẻ <ACTION>{...}</ACTION> nếu có
             action_status_note: Optional[str] = None
+            # Layer 1: Tìm ACTION match chuẩn
             action_match = re.search(
                 r"<ACTION>\s*(\{.*?\})\s*</ACTION>", raw_ai_reply, flags=re.DOTALL
             )
+            # Layer 1: Xoá ACTION tag chuẩn
             ai_reply = re.sub(
                 r"<ACTION>\s*\{.*?\}\s*</ACTION>", "", raw_ai_reply, flags=re.DOTALL
+            ).strip()
+            # Layer 2: Xoá ACTION trong backtick/code block (AI đôi khi wrap trong `)
+            ai_reply = re.sub(
+                r"`+\s*<ACTION>.*?</ACTION>\s*`+", "", ai_reply, flags=re.DOTALL
+            ).strip()
+            # Layer 3: Xoá unicode angle brackets ＜ACTION＞...＜/ACTION＞
+            ai_reply = re.sub(
+                r"[＜<]\s*/?ACTION\s*[＞>]", "", ai_reply, flags=re.IGNORECASE
+            ).strip()
+            # Layer 4: Nuke bất kỳ fragment <ACTION> hoặc </ACTION> còn sót
+            ai_reply = re.sub(
+                r"</?ACTION>", "", ai_reply, flags=re.IGNORECASE
+            ).strip()
+            # Layer 5: Dọn JSON rác còn sót ({\"type\":...}) nếu nằm trơ trọi cuối msg
+            ai_reply = re.sub(
+                r'\s*\{"type"\s*:\s*"[a-z_]+"[^}]*\}\s*$', "", ai_reply
             ).strip()
 
             if action_match and authorized:
