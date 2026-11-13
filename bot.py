@@ -1571,34 +1571,50 @@ async def on_message(message: discord.Message) -> None:
 
             # Tách và thực thi thẻ <ACTION>{...}</ACTION> nếu có
             action_status_note: Optional[str] = None
-            # Layer 1: Tìm ACTION match chuẩn
-            action_match = re.search(
-                r"<ACTION>\s*(\{.*?\})\s*</ACTION>", raw_ai_reply, flags=re.DOTALL
-            )
-            # Layer 1: Xoá ACTION tag chuẩn
-            ai_reply = re.sub(
-                r"<ACTION>\s*\{.*?\}\s*</ACTION>", "", raw_ai_reply, flags=re.DOTALL
-            ).strip()
-            # Layer 2: Xoá ACTION trong backtick/code block (AI đôi khi wrap trong `)
-            ai_reply = re.sub(
-                r"`+\s*<ACTION>.*?</ACTION>\s*`+", "", ai_reply, flags=re.DOTALL
-            ).strip()
-            # Layer 3: Xoá unicode angle brackets ＜ACTION＞...＜/ACTION＞
-            ai_reply = re.sub(
-                r"[＜<]\s*/?ACTION\s*[＞>]", "", ai_reply, flags=re.IGNORECASE
-            ).strip()
-            # Layer 4: Nuke bất kỳ fragment <ACTION> hoặc </ACTION> còn sót
-            ai_reply = re.sub(
-                r"</?ACTION>", "", ai_reply, flags=re.IGNORECASE
-            ).strip()
-            # Layer 5: Dọn JSON rác còn sót ({\"type\":...}) nếu nằm trơ trọi cuối msg
-            ai_reply = re.sub(
-                r'\s*\{"type"\s*:\s*"[a-z_]+"[^}]*\}\s*$', "", ai_reply
-            ).strip()
 
-            if action_match and authorized:
+            # ========== EXTRACT: tìm JSON action từ nhiều dạng AI có thể output ==========
+            action_json_str: Optional[str] = None
+            # Pattern 1: chuẩn <ACTION>{...}</ACTION>
+            _m = re.search(r"<ACTION>\s*(\{.*?\})\s*</ACTION>", raw_ai_reply, flags=re.DOTALL)
+            if _m:
+                action_json_str = _m.group(1)
+            else:
+                # Pattern 2: thiếu thẻ mở — chỉ có {..."type":...}</ACTION>
+                _m = re.search(r'(\{"type"\s*:\s*"[a-z_]+"[^}]*\})\s*</ACTION>', raw_ai_reply, flags=re.DOTALL | re.IGNORECASE)
+                if _m:
+                    action_json_str = _m.group(1)
+                else:
+                    # Pattern 3: thiếu thẻ đóng — <ACTION>{...} ở cuối
+                    _m = re.search(r'<ACTION>\s*(\{"type"\s*:\s*"[a-z_]+"[^}]*\})\s*$', raw_ai_reply, flags=re.DOTALL | re.IGNORECASE)
+                    if _m:
+                        action_json_str = _m.group(1)
+                    else:
+                        # Pattern 4: không có thẻ nào — JSON trơ trọi cuối msg
+                        _m = re.search(r'(\{"type"\s*:\s*"(?:assign_task|vip_add|vip_remove|vip_list|timeout|untimeout|kick|ban|unban|add|clear_msg|nickname|remind|poll|reset_memory|quiet_mode|talk_mode)"[^}]*\})\s*$', raw_ai_reply, flags=re.DOTALL)
+                        if _m:
+                            action_json_str = _m.group(1)
+
+            # ========== CLEANUP: dọn sạch MỌI dấu vết ACTION/JSON khỏi tin nhắn ==========
+            ai_reply = raw_ai_reply
+            # Xoá <ACTION>{...}</ACTION> chuẩn
+            ai_reply = re.sub(r"<ACTION>\s*\{.*?\}\s*</ACTION>", "", ai_reply, flags=re.DOTALL)
+            # Xoá {..."type":...}</ACTION> (thiếu thẻ mở)
+            ai_reply = re.sub(r'\{[^}]*"type"\s*:\s*"[a-z_]+"[^}]*\}\s*</ACTION>', "", ai_reply, flags=re.DOTALL | re.IGNORECASE)
+            # Xoá <ACTION>{...} (thiếu thẻ đóng)
+            ai_reply = re.sub(r'<ACTION>\s*\{[^}]*"type"\s*:\s*"[a-z_]+"[^}]*\}', "", ai_reply, flags=re.DOTALL | re.IGNORECASE)
+            # Xoá trong backtick `<ACTION>...</ACTION>`
+            ai_reply = re.sub(r"`+[^`]*</?ACTION>[^`]*`+", "", ai_reply, flags=re.DOTALL | re.IGNORECASE)
+            # Nuke mọi <ACTION>, </ACTION>, ＜ACTION＞, ＜/ACTION＞ còn sót
+            ai_reply = re.sub(r"[＜<]\s*/?ACTION\s*[＞>]", "", ai_reply, flags=re.IGNORECASE)
+            # Dọn JSON action rác trơ trọi cuối msg (không có thẻ bao)
+            ai_reply = re.sub(r'\s*\{"type"\s*:\s*"[a-z_]+"[^}]*\}\s*$', "", ai_reply)
+            # Dọn JSON action rác ở bất kỳ đâu nếu nó nằm một mình trên 1 dòng
+            ai_reply = re.sub(r'^\s*\{"type"\s*:\s*"[a-z_]+"[^}]*\}\s*$', "", ai_reply, flags=re.MULTILINE)
+            ai_reply = ai_reply.strip()
+
+            if action_json_str and authorized:
                 try:
-                    action_json = json.loads(action_match.group(1))
+                    action_json = json.loads(action_json_str)
                     action_status_note = await execute_natural_action(
                         action_json, message, target_member
                     )
