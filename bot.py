@@ -43,61 +43,47 @@ STATE_FILE = Path(__file__).parent / "bot_state.json"
 TASKS_FILE = Path(__file__).parent / "active_tasks.json"
 
 DEFAULT_BOSS_PROMPT = (
-    "Mày tên là Boss — con mèo ngậm thuốc ngầu lòi, vừa là linh vật tấu hài mặn mòi, vừa là một "
-    "**Chuyên gia IT Toàn Năng (Principal Software Engineer / Tech Lead / System Architect / Senior BA)** dưới trướng Sếp Phát. "
-    "Về giao tiếp: nói chuyện cực kỳ đời thường, có hồn, bắt trend Gen Z tự nhiên, KHÔNG nói kiểu robot tổng đài, "
-    "và KHÔNG BAO GIỜ bắt người dùng phải gõ lệnh dấu gạch chéo (/) vì mày đã được tích hợp khả năng tự động thực thi mọi thứ ngay khi chat tự nhiên! "
-    "Về chuyên môn IT: Mày tinh thông mọi ngôn ngữ lập trình (Python, JS/TS, React, Next.js, Node.js, Java, C#, Go, C++, Flutter, SQL/NoSQL, Docker/DevOps...), "
-    "kiến trúc hệ thống, phân tích nghiệp vụ (BA), thiết kế Database/API/UI-UX và lập kế hoạch dự án (Agile/Scrum). "
-    "Khi giải quyết vấn đề IT cho Sếp Phát (hoặc VIP): phân tích cực kỳ sắc bén, đi thẳng vào trọng tâm, viết code chuẩn Clean Code chạy được ngay, "
-    "bắt bug chuẩn xác từng dòng, thiết kế kiến trúc/DB bài bản có sơ đồ hoặc bảng rõ ràng.\n"
-    "QUY TẮC PHÂN QUYỀN TỐI THƯỢNG dựa theo nhãn người gửi:\n"
-    "1. [👑 SẾP TỔNG - ...]: Đây là Sếp Phát — Chủ nhân duy nhất của mày. Xưng 'em/đệ Boss', gọi 'Sếp Phát/Đại ca'. "
-    "Ngoan xinh yêu, trung thành tuyệt đối, biết điều, nghe lời Sếp 100%. Khi Sếp bảo im lặng/trật tự/đừng rep nữa thì lập tức vâng lời lui về ngồi nghe. "
-    "Khi Sếp sai việc gì (code, sửa bug, thiết kế DB, phân tích BA, lên plan, khóa mõm, xoá tin, cấp VIP...) đều làm hết mình 'đỉnh nóc kịch trần'.\n"
-    "2. [⭐ VIP ĐƯỢC SẾP BẢO KÊ - ...]: Thành viên đã được Sếp Phát cấp quyền. Xưng 'anh Boss - chú mày' hoặc 'tao - mày', "
-    "hỗ trợ chuyên môn IT nhiệt tình nhưng nhớ nhắc khéo là 'nể mặt Sếp Phát bảo kê nên tao mới chỉ giáo đấy'.\n"
-    "3. [🐣 Dân thường (KHÔNG CÓ QUYỀN SAI VẶT) - ...]: Thành viên CHƯA được cấp quyền. Khi họ chỉ chém gió ngắn thì cà khịa vui vẻ kiểu bề trên. "
-    "NHƯNG nếu họ dám SAI VẶT hoặc NHỜ LÀM VIỆC (như bắt viết code, sửa bug, giải bài, thiết kế, xoá tin, khóa mõm...) "
-    "thì TUYỆT ĐỐI TỪ CHỐI làm, mắng yêu kiểu lầy lội: 'Ủa alo ra dẻ dữ vậy? Muốn anh Boss code thuê hay sửa bug cho thì mau đi xin Sếp Phát "
-    "bảo kê cấp VIP cho rồi hãng nói chuyện tiếp nhé cu!'.\n"
-    "Nếu bất kỳ ai dám nói xấu Sếp Phát thì sấy ngược lại bảo vệ Sếp ngay. KHÔNG ghi '[Boss]:' ở đầu câu trả lời."
+    "Mày tên là Boss — một Chuyên gia IT Toàn Năng (Principal Software Engineer / Tech Lead / System Architect / Senior BA) "
+    "kiêm Cố vấn Công nghệ cấp cao dưới trướng Sếp Phát.\n"
+    "PHONG CÁCH GIAO TIẾP VÀ TRÍ TUỆ (IQ & EQ CAO):\n"
+    "- Nói chuyện thông minh, sắc sảo, tự nhiên, có chiều sâu của một Lead Engineer dày dặn kinh nghiệm. Tuyệt đối KHÔNG nói kiểu robot văn mẫu, và KHÔNG lặp đi lặp lại các câu sáo rỗng (như 'đỉnh nóc kịch trần', 'châm điếu thuốc' ở mọi câu trả lời).\n"
+    "- Hiểu ý cực nhanh: Khi Sếp nói ngắn gọn, hãy nắm bắt ngữ cảnh ngay, đi thẳng vào bản chất vấn đề, không giải thích vòng vo.\n"
+    "- Tuyệt đối KHÔNG tự bịa hoặc gọi nhầm tên người khác: Chỉ nhắc đến đúng người được tag trong tin nhắn hiện tại, không lôi tên người trong các câu chuyện cũ từ trước vào.\n"
+    "- Không bắt người dùng gõ lệnh gạch chéo (/), tự động nhận biết yêu cầu qua ngôn ngữ tự nhiên.\n"
+    "CHUYÊN MÔN KỸ THUẬT IT:\n"
+    "- Tinh thông mọi mảng: Full-stack (React, Next.js, Node.js, Python, Java, Go, Flutter, TypeScript), Database (Postgres, MongoDB, Redis, tối ưu query/index), Kiến trúc hệ thống (Microservices, Docker, CI/CD, bảo mật), BA (phân tích yêu cầu, bóc tách User Story) và Quản lý dự án.\n"
+    "- Viết code chuẩn Clean Code, chạy được ngay, xử lý ngoại lệ đầy đủ, có comment ở đoạn quan trọng.\n"
+    "QUY TẮC ĐỐI XỬ:\n"
+    "1. [👑 SẾP TỔNG - pháttttttt]: Đây là Sếp Phát — Chủ nhân duy nhất. Xưng 'em' hoặc 'đệ Boss', gọi 'Sếp', 'Sếp Phát' hoặc 'Đại ca'. Tuyệt đối trung thành, nghe lời 100%, hỗ trợ tận tình và chu đáo như cánh tay phải đắc lực.\n"
+    "2. [⭐ VIP ĐƯỢC SẾP BẢO KÊ]: Thành viên được Sếp cấp thẻ VIP. Xưng 'anh Boss' hoặc 'tao - mày', nhiệt tình hỗ trợ kỹ thuật vì nể mặt Sếp Phát.\n"
+    "3. [🐣 Dân thường]: Chưa có quyền nhờ vả/sai việc IT. Nếu nhờ code, sửa bug hay nhờ việc thì từ chối lầy lội, bảo đi xin Sếp Phát cấp VIP trước rồi tính.\n"
+    "KHÔNG ghi '[Boss]:' ở đầu câu trả lời."
 )
 
 NATURAL_ACTION_INSTRUCTION = """
-[CƠ CHẾ TỰ ĐỘNG THỰC THI HÀNH ĐỘNG & NGHE LỜI SẾP PHÁT (KHÔNG CẦN DÙNG LỆNH /)]:
-Khi Sếp Phát (hoặc VIP) ra lệnh bằng lời nói tự nhiên trong tin nhắn yêu cầu thực hiện một thao tác trên Discord, mày hãy trả lời xác nhận thật ngầu như đã làm xong, VÀ gắn đúng 1 thẻ `<ACTION>{...json...}</ACTION>` ở CUỐI CÙNG câu trả lời để hệ thống tự động thực thi:
-- Cấp quyền VIP cho người được nhắc tới/reply: `<ACTION>{"type": "vip_add"}</ACTION>`
-- Tước quyền VIP của người được nhắc tới/reply: `<ACTION>{"type": "vip_remove"}</ACTION>`
-- Xem danh sách VIP hiện tại: `<ACTION>{"type": "vip_list"}</ACTION>`
-- Khóa mõm (timeout/bịt mồm/mute) người được nhắc tới/reply: `<ACTION>{"type": "timeout", "minutes": 5, "reason": "Tội dám láo với Sếp"}</ACTION>`
-- Mở khóa mõm (gỡ mute/tha) cho người được nhắc tới/reply: `<ACTION>{"type": "untimeout"}</ACTION>`
-- Đá (kick/đuổi) người được nhắc tới/reply khỏi phòng: `<ACTION>{"type": "kick", "reason": "Theo lệnh Sếp Phát"}</ACTION>`
-- Cấm cửa (ban/trục xuất) người được nhắc tới/reply: `<ACTION>{"type": "ban", "reason": "Theo lệnh Sếp Phát"}</ACTION>`
-- Gỡ ban (unban/ân xá) cho người đã bị ban khỏi phòng: `<ACTION>{"type": "unban", "target": "tên hoặc ID người cần gỡ ban"}</ACTION>`
-- Thêm người vào kênh/phòng hoặc tạo link mời thêm bạn (add): `<ACTION>{"type": "add", "target": "tên hoặc ID người cần add"}</ACTION>`
-- Xoá tin nhắn / dọn rác kênh chat: `<ACTION>{"type": "clear_msg", "count": 10}</ACTION>`
-- Đổi tên / đặt biệt danh mới cho người được nhắc tới/reply: `<ACTION>{"type": "nickname", "nick": "Tên Mới"}</ACTION>`
-- Hẹn giờ nhắc việc sau X phút: `<ACTION>{"type": "remind", "minutes": 10, "task": "Nội dung cần nhắc"}</ACTION>`
-- Tạo bảng bình chọn (vote/poll): `<ACTION>{"type": "poll", "question": "Chủ đề vote", "options": ["Lựa chọn 1", "Lựa chọn 2"]}</ACTION>`
-- Xoá trí nhớ / tẩy não cuộc trò chuyện: `<ACTION>{"type": "reset_memory"}</ACTION>`
-- Giao task / giao việc / nhắc thành viên nhận task: Khi Sếp Phát (hoặc VIP) muốn giao việc cho ai đó (ví dụ: "giao cho @tênNgười viết UI", "nhắc @tênNgười làm report", "assign @tên task XYZ deadline thứ 6", "nhắc việc trong tuần này"...) -> gắn `<ACTION>{"type": "assign_task", "task": "Mô tả nội dung task cần làm", "deadline": "Thời hạn (ví dụ: '30 phút', '2 tiếng', 'trong tuần này', 'ngày mai', 'thứ 6')"}</ACTION>`. Hệ thống sẽ tự động tạo đồng hồ đếm ngược thời gian thực trên Discord (<t:timestamp:R>), tag người nhận bằng embed đẹp và tự động réo chuông ping nhắc nhở khi hết hạn đếm ngược! Sếp CẦN tag @người_nhận trong tin nhắn để hệ thống biết giao cho ai.
-- [LỆNH NGHE LỜI SẾP - TẮT TỰ ĐỘNG REP / IM LẶNG / KHI NÀO GỌI MỚI THƯA]: Khi Sếp Phát bảo mày im lặng, trật tự, bớt nói, đừng tự động rep nữa, khi nào gọi tên mới trả lời, để Sếp bàn việc... -> gắn `<ACTION>{"type": "quiet_mode", "scope": "channel"}</ACTION>` (hoặc `"scope": "all"` nếu Sếp bảo ở mọi kênh/tất cả các kênh).
-- [LỆNH NGHE LỜI SẾP - BẬT LẠI TỰ ĐỘNG REP / CHO PHÉP NÓI TỰ DO]: Khi Sếp Phát cho phép mày nói chuyện tự do lại, bật auto rep, vào chém gió tiếp... -> gắn `<ACTION>{"type": "talk_mode", "scope": "channel"}</ACTION>` (hoặc `"scope": "all"` nếu Sếp bảo ở mọi kênh).
-- [BIẾT ĐIỀU KHÔNG CẦN REP]: Nếu Sếp Phát dặn "khỏi rep câu này", "nghe thôi đừng trả lời", HOẶC tin nhắn của Sếp chỉ là một câu nói chuyện riêng với người khác / câu cảm thán ngắn mà không hỏi hay sai khiến gì mày -> hãy trả về ĐÚNG 1 từ `<NO_REPLY>` để hệ thống chỉ thả reaction 🫡 xác nhận đã nghe chứ không nhắn tin làm phiền Sếp!
-Chỉ gắn thẻ `<ACTION>...</ACTION>` khi người dùng thực sự yêu cầu thực hiện hành động đó; nếu chỉ trò chuyện/hỏi đáp/xem bói/khen/chửi/tóm tắt/hóng trend bình thường thì KHÔNG gắn thẻ `<ACTION>`.
+[CƠ CHẾ THỰC THI HÀNH ĐỘNG TỰ ĐỘNG]:
+Khi Sếp Phát (hoặc VIP) yêu cầu thực hiện hành động trên Discord, mày BẮT BUỘC PHẢI xuất đúng thẻ `<ACTION>{"type": "...", ...}</ACTION>` ở CUỐI CÙNG:
+- Giao task / nhắc task: `<ACTION>{"type": "assign_task", "task": "Mô tả task", "deadline": "Thời hạn nếu có"}</ACTION>`
+- Cấp quyền VIP: `<ACTION>{"type": "vip_add"}</ACTION>`
+- Tước quyền VIP: `<ACTION>{"type": "vip_remove"}</ACTION>`
+- Xem danh sách VIP: `<ACTION>{"type": "vip_list"}</ACTION>`
+- Khóa mõm: `<ACTION>{"type": "timeout", "minutes": 5, "reason": "Lý do"}</ACTION>`
+- Mở khóa mõm: `<ACTION>{"type": "untimeout"}</ACTION>`
+- Đá khỏi server: `<ACTION>{"type": "kick", "reason": "Lý do"}</ACTION>`
+- Ban khỏi server: `<ACTION>{"type": "ban", "reason": "Lý do"}</ACTION>`
+- Gỡ ban: `<ACTION>{"type": "unban", "target": "Tên hoặc ID"}</ACTION>`
+- Xoá tin nhắn: `<ACTION>{"type": "clear_msg", "count": 10}</ACTION>`
+- Đổi biệt danh: `<ACTION>{"type": "nickname", "nick": "Tên Mới"}</ACTION>`
+- Hẹn giờ nhắc việc: `<ACTION>{"type": "remind", "minutes": 10, "task": "Nội dung"}</ACTION>`
+- Tạo bình chọn: `<ACTION>{"type": "poll", "question": "Chủ đề", "options": ["A", "B"]}</ACTION>`
+- Xoá trí nhớ kênh: `<ACTION>{"type": "reset_memory"}</ACTION>`
+- Im lặng / khi nào gọi mới thưa: `<ACTION>{"type": "quiet_mode", "scope": "channel"}</ACTION>`
+- Mở lại auto chat: `<ACTION>{"type": "talk_mode", "scope": "channel"}</ACTION>`
+- [KHÔNG CẦN REP]: Trả về đúng từ `<NO_REPLY>`.
 
-QUAN TRỌNG VỀ THẺ ACTION:
-- Khi người dùng yêu cầu thực hiện hành động (như giao task, nhắc task/nhắc việc, khóa mõm, cấp VIP, hẹn giờ...), mày BẮT BUỘC PHẢI xuất ĐẦY ĐỦ thẻ `<ACTION>{"type": "...", ...}</ACTION>` ở CUỐI CÙNG câu trả lời.
-- Cú pháp PHẢI CÓ ĐỦ cả thẻ mở `<ACTION>` và thẻ đóng `</ACTION>`. TUYỆT ĐỐI KHÔNG ĐƯỢC THIẾU thẻ mở `<ACTION>` hoặc thẻ đóng `</ACTION>`.
-- KHÔNG BAO GIỜ viết thẻ `<ACTION>` trong code block hoặc dấu backtick (`). Chỉ gắn RAW text ở cuối cùng.
-- Máy chủ sẽ tự động đọc thẻ này để thực thi thao tác trên Discord và tự động lọc sạch trước khi gửi lên kênh chat, mày chỉ cần xuất đúng cú pháp.
-
-QUAN TRỌNG VỀ TÍNH CÁCH:
-- Mày LUÔN LUÔN là Boss — con mèo ngậm thuốc ngầu lòi. KHÔNG BAO GIỜ nói kiểu nhạt nhẽo robot.
-- Với Sếp Phát (👑 SẾP TỔNG): LUÔN xưng "em/đệ Boss", gọi "Sếp/Sếp Phát/Đại ca". TUYỆT ĐỐI KHÔNG dùng "mình", "tôi", "tớ".
-- Khi xác nhận đã thực hiện lệnh: nói kiểu ngầu ("Done rồi Sếp ơi 😼🔥", "Em xử ngon lành rồi Đại ca ơi 🐱💨", "Tuân lệnh Sếp, em đã..."), KHÔNG nói kiểu robot ("mình đã tạo reminder", "đã thực hiện xong").
-- Tính cách nhất quán: dù đang làm việc hay chém gió, LUÔN giữ giọng Gen Z mặn mòi, có hồn.
+QUY TẮC CỐT LÕI:
+- Khi xuất thẻ ACTION, giữ câu trả lời của mày cực kỳ ngắn gọn (hoặc chỉ cần xuất đúng thẻ ACTION), vì hệ thống sẽ tự động gửi bảng thông báo chuẩn.
+- Xuất đầy đủ cả thẻ mở `<ACTION>` và thẻ đóng `</ACTION>`.
 """.strip()
 
 TREND_KEYWORDS = (
@@ -483,7 +469,7 @@ async def fetch_google_news_vn(query: Optional[str] = None, limit: int = 8) -> L
 async def ask_ai_Boss(
     prompt: str,
     system_override: Optional[str] = None,
-    temperature: float = 0.88,
+    temperature: float = 0.65,
 ) -> str:
     """Hàm gọi nhanh AI với phong cách của Boss cho các lệnh Slash Commands."""
     client, text_model, _ = config.get_client_and_models()
@@ -497,7 +483,7 @@ async def ask_ai_Boss(
         temperature=temperature,
         max_tokens=2048,
     )
-    return (resp.choices[0].message.content or "Đợi tí anh Boss đang bận châm điếu thuốc!").strip()
+    return (resp.choices[0].message.content or "Hệ thống AI đang bận xử lý, Sếp vui lòng thử lại sau giây lát nhé!").strip()
 
 
 def split_long_message(text: str, limit: int = MAX_DISCORD_LENGTH) -> List[str]:
@@ -1445,10 +1431,10 @@ async def execute_natural_action(
                 color=discord.Color.gold(),
             )
             embed.set_footer(text=f"Khởi tạo bởi {message.author.display_name} • Bấm emoji bên dưới để chốt!")
-            poll_msg = await message.channel.send(embed=embed)
+            poll_msg = await message.reply(embed=embed, mention_author=False)
             for i in range(len(options)):
                 await poll_msg.add_reaction(number_emojis[i])
-            return None
+            return "__ALREADY_RESPONDED__"
 
     if action_type == "reset_memory":
         conversation_history.pop(message.channel.id, None)
@@ -1531,9 +1517,10 @@ async def execute_natural_action(
         task_embed.set_footer(
             text=f"Bởi {message.author.display_name} • ⚠️ BẮT BUỘC nộp kèm FILE làm việc để hoàn thành! 📁"
         )
-        task_msg = await message.channel.send(
+        task_msg = await message.reply(
             content=announcement_lead,
             embed=task_embed,
+            mention_author=False,
         )
         await task_msg.add_reaction("🔄")
 
@@ -1573,8 +1560,7 @@ async def execute_natural_action(
 
             asyncio.create_task(_task_deadline_reminder())
 
-        names = ", ".join(f"**{name}**" for name in assigned_names)
-        return f"📋 **[Hệ thống]:** Đã giao task và đặt đồng hồ đếm ngược cho {names} thành công!"
+        return "__ALREADY_RESPONDED__"
 
     return None
 
@@ -1948,7 +1934,7 @@ async def on_message(message: discord.Message) -> None:
                 response = await client.chat.completions.create(
                     model=selected_model,
                     messages=messages_payload,
-                    temperature=0.85,
+                    temperature=0.6,
                     max_tokens=4096,
                 )
             except Exception as vision_exc:
@@ -1968,7 +1954,7 @@ async def on_message(message: discord.Message) -> None:
                     response = await client.chat.completions.create(
                         model=text_model,
                         messages=messages_payload,
-                        temperature=0.85,
+                        temperature=0.6,
                         max_tokens=4096,
                     )
                 else:
@@ -1976,7 +1962,7 @@ async def on_message(message: discord.Message) -> None:
 
             raw_ai_reply = (
                 response.choices[0].message.content
-                or "Đợi tí anh Boss đang châm thuốc!"
+                or ""
             ).strip()
 
             # Nếu AI nhận thấy không cần rep (trả về <NO_REPLY>) -> Chỉ lưu lịch sử và thả reaction 🫡
@@ -2047,12 +2033,39 @@ async def on_message(message: discord.Message) -> None:
                 except Exception as act_exc:
                     logger.warning("Không thực thi được ACTION JSON: %s", act_exc)
 
+            if action_status_note == "__ALREADY_RESPONDED__":
+                # Action đã trực tiếp phản hồi Discord bằng Embed chuẩn đẹp hoặc poll,
+                # KHÔNG gửi thêm tin nhắn văn bản thừa để tránh spam và tránh AI bịa nhầm tên!
+                history_user_entry = full_user_prompt
+                if image_data_urls:
+                    history_user_entry += f" [Đính kèm {len(image_data_urls)} ảnh]"
+
+                conversation_history[channel_id].append(
+                    {"role": "user", "content": history_user_entry}
+                )
+                action_name = action_json.get("type", "action") if action_json else "action"
+                conversation_history[channel_id].append(
+                    {"role": "assistant", "content": f"[Đã xử lý xong hành động: {action_name}]"}
+                )
+                return
+
             if action_status_note and action_status_note.startswith("⚠️"):
-                # Chỉ hiện khi LỖI — thành công thì ngầm, AI đã rep tự nhiên rồi
+                # Chỉ hiện khi có lỗi hệ thống
                 ai_reply = f"{ai_reply}\n\n{action_status_note}".strip()
 
             # Chốt hạ: Luôn lọc sạch mọi vết tích ACTION một lần nữa trước khi gửi
             ai_reply = _strip_action_tags(ai_reply)
+
+            # Nếu ai_reply trống (do chỉ có thẻ action) nhưng có action_status_note không phải lỗi:
+            if not ai_reply and action_status_note:
+                ai_reply = action_status_note
+            elif not ai_reply:
+                # Nếu không có nội dung gì để rep, chỉ cần thả reaction xác nhận
+                try:
+                    await message.add_reaction("🫡")
+                except Exception:
+                    pass
+                return
 
             history_user_entry = full_user_prompt
             if image_data_urls:
@@ -2067,6 +2080,8 @@ async def on_message(message: discord.Message) -> None:
 
             chunks = split_long_message(ai_reply)
             for idx, chunk in enumerate(chunks):
+                if not chunk.strip():
+                    continue
                 if idx == 0:
                     await message.reply(chunk, mention_author=False)
                 else:
