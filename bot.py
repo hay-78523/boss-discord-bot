@@ -40,6 +40,7 @@ CODE_EXTENSIONS = (
 MAX_DISCORD_LENGTH = 1950
 VIP_FILE = Path(__file__).parent / "vip_users.json"
 STATE_FILE = Path(__file__).parent / "bot_state.json"
+TASKS_FILE = Path(__file__).parent / "active_tasks.json"
 
 DEFAULT_BOSS_PROMPT = (
     "Mày tên là Boss — con mèo ngậm thuốc ngầu lòi, vừa là linh vật tấu hài mặn mòi, vừa là một "
@@ -1011,6 +1012,110 @@ def parse_task_deadline(text: str) -> Tuple[int, str]:
     return int(target.timestamp()), "24 giờ tới (mặc định)"
 
 
+def _load_tasks() -> Dict[str, Any]:
+    """Tải danh sách các task đang hoạt động từ file active_tasks.json."""
+    if TASKS_FILE.exists():
+        try:
+            return json.loads(TASKS_FILE.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Không đọc được file active_tasks.json: %s", exc)
+    return {}
+
+
+def _save_tasks(tasks: Dict[str, Any]) -> None:
+    """Lưu danh sách task vào file active_tasks.json."""
+    try:
+        TASKS_FILE.write_text(
+            json.dumps(tasks, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception as exc:
+        logger.warning("Không lưu được file active_tasks.json: %s", exc)
+
+
+def record_new_task(
+    message_id: int,
+    channel_id: int,
+    guild_id: Optional[int],
+    creator_id: int,
+    creator_name: str,
+    assigned_user_ids: List[int],
+    assigned_names: List[str],
+    task_desc: str,
+    deadline_ts: int,
+) -> None:
+    """Ghi nhận một task mới được giao vào danh sách theo dõi."""
+    tasks = _load_tasks()
+    tasks[str(message_id)] = {
+        "task_id": str(message_id),
+        "message_id": message_id,
+        "channel_id": channel_id,
+        "guild_id": guild_id,
+        "creator_id": creator_id,
+        "creator_name": creator_name,
+        "assigned_user_ids": assigned_user_ids,
+        "assigned_names": assigned_names,
+        "task_desc": task_desc,
+        "deadline_ts": deadline_ts,
+        "status": "pending",
+        "created_at": int(datetime.datetime.now().timestamp()),
+        "submitted_file": None,
+        "submitted_at": None,
+        "submitted_by_id": None,
+    }
+    _save_tasks(tasks)
+
+
+def get_pending_task_for_user(
+    channel_id: int, user_id: int, reply_msg_id: Optional[int] = None
+) -> Optional[Dict[str, Any]]:
+    """Tìm task đang chờ nộp (pending) của thành viên trong kênh."""
+    tasks = _load_tasks()
+    # 1. Nếu đang reply trực tiếp tin nhắn của task đó
+    if reply_msg_id and str(reply_msg_id) in tasks:
+        t = tasks[str(reply_msg_id)]
+        if t.get("status") == "pending":
+            return t
+
+    # 2. Tìm các task pending của user trong kênh này
+    matched: List[Dict[str, Any]] = []
+    for t in tasks.values():
+        if (
+            t.get("status") == "pending"
+            and t.get("channel_id") == channel_id
+            and user_id in t.get("assigned_user_ids", [])
+        ):
+            matched.append(t)
+
+    if matched:
+        # Lấy task mới nhất được giao
+        matched.sort(key=lambda x: x.get("created_at", 0), reverse=True)
+        return matched[0]
+
+    return None
+
+
+def mark_task_completed(
+    task_id: str, file_info: str, user_id: int
+) -> Optional[Dict[str, Any]]:
+    """Đánh dấu task đã hoàn thành sau khi nộp file hợp lệ."""
+    tasks = _load_tasks()
+    if task_id in tasks:
+        t = tasks[task_id]
+        t["status"] = "completed"
+        t["submitted_file"] = file_info
+        t["submitted_at"] = int(datetime.datetime.now().timestamp())
+        t["submitted_by_id"] = user_id
+        _save_tasks(tasks)
+        return t
+    return None
+
+
+def get_task_by_id(task_id: Union[int, str]) -> Optional[Dict[str, Any]]:
+    """Lấy thông tin task theo ID tin nhắn task."""
+    tasks = _load_tasks()
+    return tasks.get(str(task_id))
+
+
 def clean_bot_mention(message: discord.Message) -> str:
     content = message.clean_content
     if bot.user:
@@ -1418,45 +1523,224 @@ async def execute_natural_action(
                 f"📝 **Nội dung:** {task_desc}\n\n"
                 f"⏳ **Hạn chót & Đếm ngược:** <t:{deadline_ts}:F> (<t:{deadline_ts}:R>)\n\n"
                 f"👤 **Người giao/nhắc:** {message.author.mention}\n"
-                f"🎯 **Người nhận:** {mention_str}"
+                f"🎯 **Người nhận:** {mention_str}\n\n"
+                f"📁 **Quy tắc duyệt Done:** Đính kèm FILE làm việc (tài liệu/code/báo cáo hoặc link sản phẩm) vào kênh này thì Boss mới tự động tick Done!"
             ),
             color=discord.Color.gold() if is_reminder else discord.Color.orange(),
         )
         task_embed.set_footer(
-            text=f"Bởi {message.author.display_name} • Hết giờ bot sẽ ping réo • React ✅ khi hoàn thành!"
+            text=f"Bởi {message.author.display_name} • ⚠️ BẮT BUỘC nộp kèm FILE làm việc để hoàn thành! 📁"
         )
         task_msg = await message.channel.send(
             content=announcement_lead,
             embed=task_embed,
         )
-        await task_msg.add_reaction("✅")
         await task_msg.add_reaction("🔄")
+
+        # Lưu thông tin task vào hệ thống theo dõi
+        assigned_uids = [m.id for m in targets if hasattr(m, "id")]
+        assigned_names = [
+            getattr(m, "display_name", getattr(m, "name", str(m))) for m in targets
+        ]
+        record_new_task(
+            message_id=task_msg.id,
+            channel_id=message.channel.id,
+            guild_id=message.guild.id if message.guild else None,
+            creator_id=message.author.id,
+            creator_name=message.author.display_name,
+            assigned_user_ids=assigned_uids,
+            assigned_names=assigned_names,
+            task_desc=task_desc,
+            deadline_ts=deadline_ts,
+        )
 
         # Tự động hẹn giờ bắn ping réo khi hết thời gian đếm ngược (nếu <= 7 ngày)
         diff_seconds = max(0, deadline_ts - int(datetime.datetime.now().timestamp()))
         if 0 < diff_seconds <= 86400 * 7:
             async def _task_deadline_reminder() -> None:
                 await asyncio.sleep(diff_seconds)
+                # Chỉ ping réo nếu task vẫn đang pending
+                current_t = get_task_by_id(task_msg.id)
+                if current_t and current_t.get("status") != "pending":
+                    return
                 try:
                     await message.channel.send(
                         f"⏰ **HẾT GIỜ RỒI {mention_str} ƠI!**\n"
-                        f"👉 Task: **{task_desc}** đã hết hạn đếm ngược (<t:{deadline_ts}:R>)! Mau nộp báo cáo cho {message.author.mention} kẻo bị sấy nhé! 😼🔥"
+                        f"👉 Task: **{task_desc}** đã hết hạn đếm ngược (<t:{deadline_ts}:R>)! Mau nộp file báo cáo cho {message.author.mention} kẻo bị Sếp sấy nhé! 😼🔥"
                     )
                 except Exception as rem_exc:
                     logger.warning("Lỗi gửi ping hết hạn task: %s", rem_exc)
 
             asyncio.create_task(_task_deadline_reminder())
 
-        names = ", ".join(f"**{getattr(m, 'display_name', getattr(m, 'name', str(m)))}**" for m in targets)
+        names = ", ".join(f"**{name}**" for name in assigned_names)
         return f"📋 **[Hệ thống]:** Đã giao task và đặt đồng hồ đếm ngược cho {names} thành công!"
 
     return None
 
 
 @bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
+    """Chặn hành vi bấm lụi reaction ✅ khi chưa nộp file làm việc."""
+    if bot.user and payload.user_id == bot.user.id:
+        return
+    if str(payload.emoji) == "✅":
+        task = get_task_by_id(payload.message_id)
+        if task and task.get("status") == "pending":
+            channel = bot.get_channel(payload.channel_id)
+            if channel:
+                try:
+                    msg = await channel.fetch_message(payload.message_id)
+                    user = bot.get_user(payload.user_id) or await bot.fetch_user(
+                        payload.user_id
+                    )
+                    if user and not user.bot:
+                        # Gỡ bỏ reaction bấm lụi
+                        await msg.remove_reaction(payload.emoji, user)
+                        # Bắn cảnh báo tự hủy sau 10 giây
+                        warning_msg = await channel.send(
+                            f"⚠️ {user.mention} **Khoan đã!** Task này **BẮT BUỘC phải gửi FILE làm việc** "
+                            f"(đính kèm file code, tài liệu, báo cáo, link doc...) vào kênh thì Boss mới duyệt **DONE** nhé! "
+                            f"Đừng có bấm lụi! 😼📁"
+                        )
+
+                        async def _cleanup_warn():
+                            await asyncio.sleep(10)
+                            try:
+                                await warning_msg.delete()
+                            except Exception:
+                                pass
+
+                        asyncio.create_task(_cleanup_warn())
+                except Exception as exc:
+                    logger.warning("Lỗi xử lý reaction check file: %s", exc)
+
+
+@bot.event
 async def on_message(message: discord.Message) -> None:
     if message.author.bot:
         return
+
+    # ================= KIỂM TRA NỘP FILE HOÀN THÀNH TASK =================
+    has_attachments = bool(message.attachments)
+    work_links = re.findall(
+        r"https?://(?:github\.com|gitlab\.com|drive\.google\.com|docs\.google\.com|sheets\.google\.com|figma\.com|notion\.so|canva\.com|dropbox\.com)\S+",
+        message.content,
+    )
+    is_work_submission = has_attachments or bool(work_links)
+
+    # 1. Nếu có nộp file làm việc -> Kiểm tra xem thành viên này có task pending không
+    if is_work_submission:
+        replied_target_id = None
+        if message.reference and message.reference.message_id:
+            replied_target_id = message.reference.message_id
+
+        pending_task = get_pending_task_for_user(
+            channel_id=message.channel.id,
+            user_id=message.author.id,
+            reply_msg_id=replied_target_id,
+        )
+        if pending_task:
+            file_parts = []
+            if message.attachments:
+                file_parts.extend(
+                    f"[{att.filename}]({att.url})" for att in message.attachments
+                )
+            if work_links:
+                file_parts.extend(
+                    f"[Link sản phẩm/tài liệu]({link})" for link in work_links
+                )
+            file_info = ", ".join(file_parts)
+
+            # Đánh dấu task hoàn thành
+            mark_task_completed(
+                task_id=pending_task["task_id"],
+                file_info=file_info,
+                user_id=message.author.id,
+            )
+
+            # Cập nhật embed task gốc sang màu xanh lá ✅
+            try:
+                task_channel = bot.get_channel(pending_task["channel_id"])
+                if task_channel:
+                    orig_msg = await task_channel.fetch_message(
+                        pending_task["message_id"]
+                    )
+                    if orig_msg and orig_msg.embeds:
+                        now_ts = int(datetime.datetime.now().timestamp())
+                        done_embed = discord.Embed(
+                            title="✅ TASK ĐÃ HOÀN THÀNH XUẤT SẮC!",
+                            description=(
+                                f"📝 **Nội dung:** {pending_task['task_desc']}\n\n"
+                                f"📦 **File/Sản phẩm đã nộp:** {file_info}\n\n"
+                                f"⏱️ **Thời gian nộp:** <t:{now_ts}:F> (<t:{now_ts}:R>)\n\n"
+                                f"👤 **Người giao:** <@{pending_task['creator_id']}>\n"
+                                f"🎯 **Người hoàn thành:** {message.author.mention}"
+                            ),
+                            color=discord.Color.green(),
+                        )
+                        done_embed.set_footer(
+                            text=f"Hoàn thành bởi {message.author.display_name} • Đã nộp file hợp lệ! 📁✅"
+                        )
+                        await orig_msg.edit(embed=done_embed)
+                        try:
+                            await orig_msg.clear_reactions()
+                            await orig_msg.add_reaction("✅")
+                        except Exception:
+                            pass
+            except Exception as edit_exc:
+                logger.warning("Không thể sửa embed task gốc: %s", edit_exc)
+
+            celebrate_msg = (
+                f"🎉 **DONE TASK RỒI SẾP <@{pending_task['creator_id']}> ƠI!**\n"
+                f"👤 {message.author.mention} vừa nộp file làm việc hợp lệ:\n"
+                f"👉 **File/Link:** {file_info}\n"
+                f"📝 **Task:** **{pending_task['task_desc']}**\n"
+                f"✅ **Trạng thái:** Đệ Boss đã kiểm tra có file đầy đủ và đóng dấu **HOÀN THÀNH** rồi nhé! Đỉnh nóc kịch trần! 🚀📁🔥"
+            )
+            await message.reply(celebrate_msg, mention_author=False)
+            try:
+                await message.add_reaction("✅")
+            except Exception:
+                pass
+            return
+
+    # 2. Nếu thành viên báo cáo mồm 'xong rồi / done rồi' nhưng KHÔNG có file
+    done_verbal_keywords = (
+        "xong rồi",
+        "done rồi",
+        "hoàn thành rồi",
+        "xong task",
+        "done task",
+        "làm xong rồi",
+        "nộp task",
+        "xong việc rồi",
+        "đã xong",
+        "em làm xong",
+        "tôi làm xong",
+        "xong roi",
+        "done roi",
+    )
+    raw_lower = message.clean_content.lower()
+    if any(k in raw_lower for k in done_verbal_keywords) and not is_work_submission:
+        replied_target_id = None
+        if message.reference and message.reference.message_id:
+            replied_target_id = message.reference.message_id
+
+        pending_task = get_pending_task_for_user(
+            channel_id=message.channel.id,
+            user_id=message.author.id,
+            reply_msg_id=replied_target_id,
+        )
+        if pending_task:
+            await message.reply(
+                f"⚠️ **Ủa alo {message.author.mention}?** Báo cáo mồm là không tính nhé!\n"
+                f"Sếp <@{pending_task['creator_id']}> quy định là **BẮT BUỘC PHẢI GỬI FILE LÀM VIỆC** "
+                f"(đính kèm file code, word, excel, pdf, zip hoặc link tài liệu/sản phẩm) lên kênh này thì anh Boss mới duyệt **DONE TASK**!\n"
+                f"Mau đính kèm file nộp lên đây đi cu! 😼📁",
+                mention_author=False,
+            )
+            return
 
     replied_msg, reply_context_text, replied_images = await extract_reply_context(
         message
