@@ -1610,6 +1610,11 @@ async def on_message(message: discord.Message) -> None:
             ai_reply = re.sub(r'\s*\{"type"\s*:\s*"[a-z_]+"[^}]*\}\s*$', "", ai_reply)
             # Dọn JSON action rác ở bất kỳ đâu nếu nó nằm một mình trên 1 dòng
             ai_reply = re.sub(r'^\s*\{"type"\s*:\s*"[a-z_]+"[^}]*\}\s*$', "", ai_reply, flags=re.MULTILINE)
+            # FINAL SAFETY NET: str.replace() — không regex, không thể sai
+            for _tag in ("<ACTION>", "</ACTION>", "<action>", "</action>",
+                         "< ACTION>", "< /ACTION>", "<ACTION >", "</ACTION >",
+                         "＜ACTION＞", "＜/ACTION＞"):
+                ai_reply = ai_reply.replace(_tag, "")
             ai_reply = ai_reply.strip()
 
             if action_json_str and authorized:
