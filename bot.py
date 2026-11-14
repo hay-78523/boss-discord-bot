@@ -80,7 +80,7 @@ Khi Sếp Phát (hoặc VIP) ra lệnh bằng lời nói tự nhiên trong tin n
 - Hẹn giờ nhắc việc sau X phút: `<ACTION>{"type": "remind", "minutes": 10, "task": "Nội dung cần nhắc"}</ACTION>`
 - Tạo bảng bình chọn (vote/poll): `<ACTION>{"type": "poll", "question": "Chủ đề vote", "options": ["Lựa chọn 1", "Lựa chọn 2"]}</ACTION>`
 - Xoá trí nhớ / tẩy não cuộc trò chuyện: `<ACTION>{"type": "reset_memory"}</ACTION>`
-- Giao task / giao việc / nhắc thành viên nhận task: Khi Sếp Phát (hoặc VIP) muốn giao việc cho ai đó (ví dụ: "giao cho @tênNgười viết UI", "nhắc @tênNgười làm report", "assign @tên task XYZ deadline thứ 6"...) -> gắn `<ACTION>{"type": "assign_task", "task": "Mô tả nội dung task cần làm", "deadline": "Thời hạn nếu có (optional)"}</ACTION>`. Hệ thống sẽ tự động tag (mention) người nhận bằng embed đẹp có nội dung task, deadline, reaction ✅🔄 cho người nhận xác nhận. Sếp Phát CẦN tag @người_nhận trong tin nhắn để hệ thống biết giao cho ai.
+- Giao task / giao việc / nhắc thành viên nhận task: Khi Sếp Phát (hoặc VIP) muốn giao việc cho ai đó (ví dụ: "giao cho @tênNgười viết UI", "nhắc @tênNgười làm report", "assign @tên task XYZ deadline thứ 6", "nhắc việc trong tuần này"...) -> gắn `<ACTION>{"type": "assign_task", "task": "Mô tả nội dung task cần làm", "deadline": "Thời hạn (ví dụ: '30 phút', '2 tiếng', 'trong tuần này', 'ngày mai', 'thứ 6')"}</ACTION>`. Hệ thống sẽ tự động tạo đồng hồ đếm ngược thời gian thực trên Discord (<t:timestamp:R>), tag người nhận bằng embed đẹp và tự động réo chuông ping nhắc nhở khi hết hạn đếm ngược! Sếp CẦN tag @người_nhận trong tin nhắn để hệ thống biết giao cho ai.
 - [LỆNH NGHE LỜI SẾP - TẮT TỰ ĐỘNG REP / IM LẶNG / KHI NÀO GỌI MỚI THƯA]: Khi Sếp Phát bảo mày im lặng, trật tự, bớt nói, đừng tự động rep nữa, khi nào gọi tên mới trả lời, để Sếp bàn việc... -> gắn `<ACTION>{"type": "quiet_mode", "scope": "channel"}</ACTION>` (hoặc `"scope": "all"` nếu Sếp bảo ở mọi kênh/tất cả các kênh).
 - [LỆNH NGHE LỜI SẾP - BẬT LẠI TỰ ĐỘNG REP / CHO PHÉP NÓI TỰ DO]: Khi Sếp Phát cho phép mày nói chuyện tự do lại, bật auto rep, vào chém gió tiếp... -> gắn `<ACTION>{"type": "talk_mode", "scope": "channel"}</ACTION>` (hoặc `"scope": "all"` nếu Sếp bảo ở mọi kênh).
 - [BIẾT ĐIỀU KHÔNG CẦN REP]: Nếu Sếp Phát dặn "khỏi rep câu này", "nghe thôi đừng trả lời", HOẶC tin nhắn của Sếp chỉ là một câu nói chuyện riêng với người khác / câu cảm thán ngắn mà không hỏi hay sai khiến gì mày -> hãy trả về ĐÚNG 1 từ `<NO_REPLY>` để hệ thống chỉ thả reaction 🫡 xác nhận đã nghe chứ không nhắn tin làm phiền Sếp!
@@ -939,6 +939,78 @@ def _strip_action_tags(text: str) -> str:
     return text.strip()
 
 
+def parse_task_deadline(text: str) -> Tuple[int, str]:
+    """
+    Phân tích thời gian deadline từ văn bản tiếng Việt và trả về:
+    (unix_timestamp, nhãn_mô_tả)
+    Hỗ trợ: phút, tiếng/giờ, ngày, thứ trong tuần, hôm nay, ngày mai, trong tuần này.
+    Nếu không có mốc thời gian -> mặc định 24 giờ.
+    """
+    now = datetime.datetime.now()
+    text_lower = text.lower()
+
+    # 1. Phút (ví dụ: 15 phút, 30p, 45 min)
+    m = re.search(r"\b(\d+)\s*(?:phút|p\b|min)", text_lower)
+    if m:
+        mins = max(1, int(m.group(1)))
+        target = now + datetime.timedelta(minutes=mins)
+        return int(target.timestamp()), f"{mins} phút"
+
+    # 2. Tiếng / Giờ (ví dụ: 2 tiếng, 3 giờ, 1h, 4hr)
+    m = re.search(r"\b(\d+)\s*(?:tiếng|giờ|h\b|hr)", text_lower)
+    if m:
+        hours = max(1, int(m.group(1)))
+        target = now + datetime.timedelta(hours=hours)
+        return int(target.timestamp()), f"{hours} tiếng"
+
+    # 3. Ngày (ví dụ: 2 ngày, 3d, 1 day)
+    m = re.search(r"\b(\d+)\s*(?:ngày|d\b|days?)", text_lower)
+    if m:
+        days = max(1, int(m.group(1)))
+        target = now + datetime.timedelta(days=days)
+        return int(target.timestamp()), f"{days} ngày"
+
+    # 4. Trong tuần này / cuối tuần / hết tuần
+    if any(k in text_lower for k in ("trong tuần này", "cuối tuần", "hết tuần", "tuần này")):
+        days_ahead = 6 - now.weekday()
+        if days_ahead <= 0:
+            days_ahead += 7
+        target = (now + datetime.timedelta(days=days_ahead)).replace(hour=23, minute=59, second=0, microsecond=0)
+        return int(target.timestamp()), "Chủ Nhật tuần này (23:59)"
+
+    # 5. Các thứ trong tuần: thứ 2 -> thứ 7, chủ nhật
+    day_mapping = {
+        "thứ 2": 0, "thứ hai": 0, "t2": 0,
+        "thứ 3": 1, "thứ ba": 1, "t3": 1,
+        "thứ 4": 2, "thứ tư": 2, "t4": 2,
+        "thứ 5": 3, "thứ năm": 3, "t5": 3,
+        "thứ 6": 4, "thứ sáu": 4, "t6": 4,
+        "thứ 7": 5, "thứ bảy": 5, "t7": 5,
+        "chủ nhật": 6, "cn": 6,
+    }
+    for day_str, target_weekday in day_mapping.items():
+        if day_str in text_lower:
+            days_ahead = target_weekday - now.weekday()
+            if days_ahead <= 0:
+                days_ahead += 7
+            target = (now + datetime.timedelta(days=days_ahead)).replace(hour=18, minute=0, second=0, microsecond=0)
+            return int(target.timestamp()), day_str.title()
+
+    # 6. Hôm nay / trong ngày / hết ngày
+    if any(k in text_lower for k in ("hôm nay", "trong ngày", "hết ngày")):
+        target = now.replace(hour=23, minute=59, second=0, microsecond=0)
+        return int(target.timestamp()), "Hết ngày hôm nay (23:59)"
+
+    # 7. Ngày mai
+    if "ngày mai" in text_lower or "mai" in text_lower:
+        target = (now + datetime.timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
+        return int(target.timestamp()), "18:00 Ngày mai"
+
+    # 8. Mặc định nếu không ghi rõ thời gian -> Đếm ngược 24 tiếng
+    target = now + datetime.timedelta(hours=24)
+    return int(target.timestamp()), "24 giờ tới (mặc định)"
+
+
 def clean_bot_mention(message: discord.Message) -> str:
     content = message.clean_content
     if bot.user:
@@ -1305,7 +1377,7 @@ async def execute_natural_action(
     if action_type == "assign_task":
         # Giao task / nhắc task cho thành viên — Sếp Phát hoặc VIP đều được dùng
         task_desc = str(action_data.get("task", "")).strip()
-        deadline = str(action_data.get("deadline", "")).strip()
+        raw_deadline = str(action_data.get("deadline", "")).strip()
         if not task_desc:
             task_desc = "Kiểm tra và hoàn thành các công việc được giao"
 
@@ -1326,6 +1398,10 @@ async def execute_natural_action(
         if not targets:
             return "⚠️ *(Sếp tag (mention @) người nhận task nhé, em không biết giao cho ai!)*"
 
+        # Tự động quét và phân tích hạn chót đếm ngược (countdown timestamp Discord)
+        time_scan_text = f"{raw_deadline} {task_desc} {message.clean_content}"
+        deadline_ts, deadline_label = parse_task_deadline(time_scan_text)
+
         # Phân biệt nhắc nhở (reminder) hay giao việc mới (new task)
         is_reminder = any(w in message.clean_content.lower() for w in ("nhắc", "đòi", "tiến độ", "hỏi task"))
         task_title = "🔔 NHẮC NHỞ CÔNG VIỆC / TASK!" if is_reminder else "📋 TASK MỚI ĐƯỢC GIAO!"
@@ -1335,19 +1411,19 @@ async def execute_natural_action(
             if is_reminder
             else f"📣 Ê {mention_str} — có task mới nè, đọc kỹ rồi triển nhanh! 🔥"
         )
-        deadline_line = f"\n⏰ **Deadline:** {deadline}" if deadline else ""
 
         task_embed = discord.Embed(
             title=task_title,
             description=(
-                f"**Nội dung:** {task_desc}{deadline_line}\n\n"
+                f"📝 **Nội dung:** {task_desc}\n\n"
+                f"⏳ **Hạn chót & Đếm ngược:** <t:{deadline_ts}:F> (<t:{deadline_ts}:R>)\n\n"
                 f"👤 **Người giao/nhắc:** {message.author.mention}\n"
                 f"🎯 **Người nhận:** {mention_str}"
             ),
             color=discord.Color.gold() if is_reminder else discord.Color.orange(),
         )
         task_embed.set_footer(
-            text=f"Bởi {message.author.display_name} • Hoàn thành task rồi react ✅ nhé!"
+            text=f"Bởi {message.author.display_name} • Hết giờ bot sẽ ping réo • React ✅ khi hoàn thành!"
         )
         task_msg = await message.channel.send(
             content=announcement_lead,
@@ -1356,8 +1432,23 @@ async def execute_natural_action(
         await task_msg.add_reaction("✅")
         await task_msg.add_reaction("🔄")
 
+        # Tự động hẹn giờ bắn ping réo khi hết thời gian đếm ngược (nếu <= 7 ngày)
+        diff_seconds = max(0, deadline_ts - int(datetime.datetime.now().timestamp()))
+        if 0 < diff_seconds <= 86400 * 7:
+            async def _task_deadline_reminder() -> None:
+                await asyncio.sleep(diff_seconds)
+                try:
+                    await message.channel.send(
+                        f"⏰ **HẾT GIỜ RỒI {mention_str} ƠI!**\n"
+                        f"👉 Task: **{task_desc}** đã hết hạn đếm ngược (<t:{deadline_ts}:R>)! Mau nộp báo cáo cho {message.author.mention} kẻo bị sấy nhé! 😼🔥"
+                    )
+                except Exception as rem_exc:
+                    logger.warning("Lỗi gửi ping hết hạn task: %s", rem_exc)
+
+            asyncio.create_task(_task_deadline_reminder())
+
         names = ", ".join(f"**{getattr(m, 'display_name', getattr(m, 'name', str(m)))}**" for m in targets)
-        return f"📋 **[Hệ thống]:** Đã nhắc task và tag {names} thành công!"
+        return f"📋 **[Hệ thống]:** Đã giao task và đặt đồng hồ đếm ngược cho {names} thành công!"
 
     return None
 
