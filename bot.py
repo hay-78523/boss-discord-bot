@@ -74,7 +74,7 @@ DEFAULT_BOSS_PROMPT = (
 NATURAL_ACTION_INSTRUCTION = """
 [CƠ CHẾ THỰC THI HÀNH ĐỘNG TỰ ĐỘNG]:
 Khi Sếp Phát (hoặc VIP) yêu cầu thực hiện hành động trên Discord, mày BẮT BUỘC PHẢI xuất đúng thẻ `<ACTION>{"type": "...", ...}</ACTION>` ở CUỐI CÙNG:
-- Giao task / nhắc task: `<ACTION>{"type": "assign_task", "task": "Mô tả task", "deadline": "Thời hạn nếu có", "phase": "Giai đoạn (bỏ trống = giai đoạn hiện tại)"}</ACTION>`
+- Giao task / nhắc task: `<ACTION>{"type": "assign_task", "task": "Mô tả task cụ thể", "assignee": ["tên người nhận"], "deadline": "Thời hạn nếu có", "phase": "Giai đoạn (bỏ trống = giai đoạn hiện tại)"}</ACTION>`
 - Đổi giai đoạn dự án hiện tại: `<ACTION>{"type": "set_phase", "phase": "Tên giai đoạn"}</ACTION>`
 - Báo cáo tình hình task ngay (hằng ngày / tổng kết tuần): `<ACTION>{"type": "report", "kind": "daily"}</ACTION>` hoặc `"kind": "weekly"`
 - Cấp quyền VIP: `<ACTION>{"type": "vip_add"}</ACTION>`
@@ -102,6 +102,7 @@ Khi Sếp Phát (hoặc VIP) yêu cầu thực hiện hành động trên Discor
 QUY TẮC CỐT LÕI:
 - Chỉ xuất ACTION khi người dùng THỰC SỰ yêu cầu hành động đó; hỏi thông tin hoặc bàn luận thì trả lời bình thường, KHÔNG xuất ACTION.
 - Mỗi câu trả lời tối đa MỘT thẻ ACTION.
+- Khi xuất ACTION, KHÔNG được khẳng định "đã tạo/đã làm xong" — hệ thống sẽ tự báo kết quả thật.
 - Khi xuất thẻ ACTION, giữ câu trả lời của mày cực kỳ ngắn gọn (hoặc chỉ cần xuất đúng thẻ ACTION), vì hệ thống sẽ tự động gửi bảng thông báo chuẩn.
 - Xuất đầy đủ cả thẻ mở `<ACTION>` và thẻ đóng `</ACTION>`.
 """.strip()
@@ -2613,11 +2614,20 @@ async def execute_natural_action(
         if message.role_mentions:
             for r in message.role_mentions:
                 targets.append(r)
+        # Không có mention thật (gõ tay "@ten" hoặc chỉ ghi tên) -> tìm thành viên theo tên
+        if not targets and message.guild:
+            raw_assignee = action_data.get("assignee") or []
+            names = raw_assignee if isinstance(raw_assignee, list) else re.split(r"[,;]| và ", str(raw_assignee))
+            names = [str(n) for n in names] + re.findall(r"@([\w.\-]+)", message.content)
+            for name in names:
+                member = find_member_by_name(message.guild, name)
+                if member and not member.bot and member not in targets:
+                    targets.append(member)
         if not targets and target_member:
             targets.append(target_member)
 
         if not targets:
-            return "⚠️ *(Sếp tag (mention @) người nhận task nhé, em không biết giao cho ai!)*"
+            return "⚠️ *(Em chưa xác định được giao cho ai — Sếp tag @người nhận (chọn từ gợi ý của Discord) hoặc ghi đúng tên hiển thị của họ nhé!)*"
 
         # Tự động quét và phân tích hạn chót đếm ngược (countdown timestamp Discord)
         time_scan_text = f"{raw_deadline} {task_desc} {message.clean_content}"
@@ -3166,7 +3176,10 @@ async def on_message(message: discord.Message) -> None:
                 )
                 return
 
-            if action_status_note:
+            if action_status_note and action_status_note.startswith("⚠️"):
+                # Hành động thất bại -> chỉ báo lỗi, bỏ lời AI (thường là "đã làm xong") để không báo sai
+                ai_reply = action_status_note
+            elif action_status_note:
                 ai_reply = f"{ai_reply}\n\n{action_status_note}".strip()
 
             # Chốt hạ: Luôn lọc sạch mọi vết tích ACTION một lần nữa trước khi gửi
