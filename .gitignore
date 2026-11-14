@@ -4,3 +4,9 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
+active_tasks.json
+reminders.json
+team_memory.json
+vip_users.json
+*service-account*.json
+settings.json

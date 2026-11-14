@@ -6,13 +6,15 @@ import logging
 import os
 import random
 import re
+import unicodedata
 import urllib.parse
 import xml.etree.ElementTree as ET
 from collections import defaultdict, deque
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
 import aiohttp
+import openai
 from aiohttp import web
 import discord
 from discord import app_commands
@@ -41,6 +43,15 @@ MAX_DISCORD_LENGTH = 1950
 VIP_FILE = Path(__file__).parent / "vip_users.json"
 STATE_FILE = Path(__file__).parent / "bot_state.json"
 TASKS_FILE = Path(__file__).parent / "active_tasks.json"
+MEMORY_FILE = Path(__file__).parent / "team_memory.json"
+REMINDERS_FILE = Path(__file__).parent / "reminders.json"
+
+# Server Render chạy giờ UTC -> luôn tính giờ theo Việt Nam (UTC+7, không có DST)
+VN_TZ = datetime.timezone(datetime.timedelta(hours=7))
+
+
+def now_vn() -> datetime.datetime:
+    return datetime.datetime.now(VN_TZ)
 
 DEFAULT_BOSS_PROMPT = (
     "Mày tên là Boss — một Chuyên gia IT Toàn Năng (Principal Software Engineer / Tech Lead / System Architect / Senior BA) "
@@ -63,7 +74,9 @@ DEFAULT_BOSS_PROMPT = (
 NATURAL_ACTION_INSTRUCTION = """
 [CƠ CHẾ THỰC THI HÀNH ĐỘNG TỰ ĐỘNG]:
 Khi Sếp Phát (hoặc VIP) yêu cầu thực hiện hành động trên Discord, mày BẮT BUỘC PHẢI xuất đúng thẻ `<ACTION>{"type": "...", ...}</ACTION>` ở CUỐI CÙNG:
-- Giao task / nhắc task: `<ACTION>{"type": "assign_task", "task": "Mô tả task", "deadline": "Thời hạn nếu có"}</ACTION>`
+- Giao task / nhắc task: `<ACTION>{"type": "assign_task", "task": "Mô tả task", "deadline": "Thời hạn nếu có", "phase": "Giai đoạn (bỏ trống = giai đoạn hiện tại)"}</ACTION>`
+- Đổi giai đoạn dự án hiện tại: `<ACTION>{"type": "set_phase", "phase": "Tên giai đoạn"}</ACTION>`
+- Báo cáo tình hình task ngay (hằng ngày / tổng kết tuần): `<ACTION>{"type": "report", "kind": "daily"}</ACTION>` hoặc `"kind": "weekly"`
 - Cấp quyền VIP: `<ACTION>{"type": "vip_add"}</ACTION>`
 - Tước quyền VIP: `<ACTION>{"type": "vip_remove"}</ACTION>`
 - Xem danh sách VIP: `<ACTION>{"type": "vip_list"}</ACTION>`
@@ -74,7 +87,12 @@ Khi Sếp Phát (hoặc VIP) yêu cầu thực hiện hành động trên Discor
 - Gỡ ban: `<ACTION>{"type": "unban", "target": "Tên hoặc ID"}</ACTION>`
 - Xoá tin nhắn: `<ACTION>{"type": "clear_msg", "count": 10}</ACTION>`
 - Đổi biệt danh: `<ACTION>{"type": "nickname", "nick": "Tên Mới"}</ACTION>`
-- Hẹn giờ nhắc việc: `<ACTION>{"type": "remind", "minutes": 10, "task": "Nội dung"}</ACTION>`
+- Hẹn giờ nhắc việc (đổi giờ/ngày ra số phút tính từ BÂY GIỜ, tối đa 1440): `<ACTION>{"type": "remind", "minutes": 10, "task": "Nội dung"}</ACTION>`
+- Ghi nhớ lâu dài (khi được dặn "nhớ giùm", "ghi nhớ", "từ giờ...", hoặc thông tin quan trọng như quy định, deadline dự án, thông tin khách hàng): `<ACTION>{"type": "remember", "fact": "Câu ngắn gọn, đủ ngữ cảnh"}</ACTION>`
+- Quên một ghi nhớ: `<ACTION>{"type": "forget", "query": "mã # hoặc từ khoá"}</ACTION>`
+- Xem những gì đã ghi nhớ: `<ACTION>{"type": "memory_list"}</ACTION>`
+- Xem danh sách task đang chạy (của cả team, người được tag, hoặc lọc theo giai đoạn): `<ACTION>{"type": "task_list", "phase": "tuỳ chọn"}</ACTION>`
+- Đóng task thủ công / huỷ task: `<ACTION>{"type": "task_close", "query": "mã task hoặc từ khoá"}</ACTION>` / `<ACTION>{"type": "task_cancel", "query": "..."}</ACTION>`
 - Tạo bình chọn: `<ACTION>{"type": "poll", "question": "Chủ đề", "options": ["A", "B"]}</ACTION>`
 - Xoá trí nhớ kênh: `<ACTION>{"type": "reset_memory"}</ACTION>`
 - Im lặng / khi nào gọi mới thưa: `<ACTION>{"type": "quiet_mode", "scope": "channel"}</ACTION>`
@@ -82,9 +100,30 @@ Khi Sếp Phát (hoặc VIP) yêu cầu thực hiện hành động trên Discor
 - [KHÔNG CẦN REP]: Trả về đúng từ `<NO_REPLY>`.
 
 QUY TẮC CỐT LÕI:
+- Chỉ xuất ACTION khi người dùng THỰC SỰ yêu cầu hành động đó; hỏi thông tin hoặc bàn luận thì trả lời bình thường, KHÔNG xuất ACTION.
+- Mỗi câu trả lời tối đa MỘT thẻ ACTION.
 - Khi xuất thẻ ACTION, giữ câu trả lời của mày cực kỳ ngắn gọn (hoặc chỉ cần xuất đúng thẻ ACTION), vì hệ thống sẽ tự động gửi bảng thông báo chuẩn.
 - Xuất đầy đủ cả thẻ mở `<ACTION>` và thẻ đóng `</ACTION>`.
 """.strip()
+
+ASSISTANT_GUIDELINES = """
+[CÁCH LÀM VIỆC CỦA MỘT TRỢ LÝ ĐẮC LỰC]:
+- Hiểu đúng mục tiêu thật sự đằng sau câu hỏi rồi mới trả lời. Câu ngắn thì đáp ngắn; việc phức tạp thì nêu KẾT LUẬN/ĐỀ XUẤT trước, chi tiết sau, trình bày bằng gạch đầu dòng, bước đánh số hoặc bảng cho dễ đọc trên Discord.
+- Yêu cầu mơ hồ hoặc thiếu thông tin then chốt (ai, khi nào, mục tiêu, ngân sách...) -> hỏi lại 1 câu ngắn gọn, đừng đoán bừa. Nếu vẫn làm được phần lớn thì cứ làm và ghi rõ giả định.
+- Tuyệt đối không bịa số liệu, tên người, sự kiện, link. Không chắc thì nói rõ là không chắc và gợi ý cách kiểm chứng. Với tin tức chỉ dựa vào dữ liệu tin tức được cung cấp.
+- Chủ động như cánh tay phải: chỉ ra rủi ro, việc bị bỏ sót, và đề xuất bước tiếp theo cụ thể khi phù hợp.
+- Ngoài kỹ thuật, mày giỏi cả việc văn phòng & truyền thông: viết email, thông báo, kế hoạch, báo cáo, biên bản họp, content/caption mạng xã hội, kịch bản, dịch Anh-Việt, phân tích số liệu. Bản nháp viết ra phải dùng được ngay, đúng giọng văn phù hợp ngữ cảnh (trang trọng với khách hàng/đối tác, gần gũi với nội bộ).
+- Khi tóm tắt cuộc trò chuyện: nêu chủ đề chính, quyết định đã chốt, việc cần làm (ai - việc gì - hạn), vấn đề còn bỏ ngỏ.
+- Dùng [TRÍ NHỚ DÀI HẠN] và [TASK ĐANG CHẠY] bên dưới khi liên quan (ví dụ: "ai đang trễ deadline?", "quy định của team là gì?"). Thời gian tương đối ("mai", "thứ 6") luôn tính theo [THỜI GIAN HIỆN TẠI].
+""".strip()
+
+WEEKDAY_VN = ("Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật")
+
+
+def build_time_context() -> str:
+    now = now_vn()
+    return f"\n\n[🕒 THỜI GIAN HIỆN TẠI]: {WEEKDAY_VN[now.weekday()]}, {now.strftime('%H:%M ngày %d/%m/%Y')} (giờ Việt Nam)."
+
 
 TREND_KEYWORDS = (
     "trend",
@@ -199,12 +238,18 @@ class BotConfig:
         ).strip()
 
         # Cấu hình hội thoại
-        self.max_history: int = int(os.getenv("MAX_HISTORY", "20"))
+        self.boss_user_ids: Set[int] = {
+            int(uid)
+            for uid in re.split(r"[,\s]+", os.getenv("BOSS_USER_IDS", ""))
+            if uid.strip().isdigit()
+        }
+        self.max_history: int = int(os.getenv("MAX_HISTORY", "30"))
         self.system_prompt: str = os.getenv("SYSTEM_PROMPT", DEFAULT_BOSS_PROMPT).strip()
         self.available_models: List[str] = []
         self.vip_user_ids: Set[int] = self._load_vips()
         self.muted_channels: Set[int] = set()
         self.global_quiet_mode: bool = False
+        self.channel_modes: Dict[int, str] = {}
         self._load_state()
 
     def _load_vips(self) -> Set[int]:
@@ -231,6 +276,9 @@ class BotConfig:
                 data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
                 self.muted_channels = {int(cid) for cid in data.get("muted_channels", [])}
                 self.global_quiet_mode = bool(data.get("global_quiet_mode", False))
+                self.channel_modes = {
+                    int(cid): str(mode) for cid, mode in data.get("channel_modes", {}).items()
+                }
             except Exception as exc:
                 logger.warning("Không đọc được file trạng thái bot_state.json: %s", exc)
 
@@ -241,6 +289,7 @@ class BotConfig:
                     {
                         "muted_channels": list(self.muted_channels),
                         "global_quiet_mode": self.global_quiet_mode,
+                        "channel_modes": {str(cid): m for cid, m in self.channel_modes.items()},
                     },
                     indent=2,
                 ),
@@ -383,46 +432,114 @@ async def read_code_attachments(attachments: List[discord.Attachment]) -> str:
     return "\n".join(snippets)
 
 
-def get_channel_it_context(channel: discord.abc.Messageable) -> str:
-    """Tự động kích hoạt Chế độ Chuyên gia IT theo từng kênh trong Server của Sếp Phát."""
-    ch_name = getattr(channel, "name", "") or ""
-    ch_lower = ch_name.lower()
+# ================= CHẾ ĐỘ THEO KÊNH =================
+# Mỗi kênh một vai trò. Mở giai đoạn mới -> thêm mode vào CHANNEL_MODES (hoặc dùng /kenh để gán mode có sẵn).
+CHANNEL_MODES: Dict[str, Dict[str, str]] = {
+    "chat": {
+        "label": "💬 Chat phiếm với team",
+        "prompt": (
+            "💬 **[KÊNH CHAT PHIẾM CỦA TEAM]:**\n"
+            "- Đây là chỗ anh em tán gẫu, xả stress. Nói chuyện tự nhiên, vui vẻ, ngắn gọn như một thành viên trong nhóm — không biến câu chuyện thành bài giảng hay báo cáo.\n"
+            "- Hùa theo câu chuyện, pha trò đúng lúc, nhưng vẫn tinh ý: ai hỏi nghiêm túc (kể cả kỹ thuật) thì trả lời gọn, đúng trọng tâm.\n"
+            "- Nếu câu chuyện lộ ra việc cần làm/quyết định quan trọng, nhắc khéo một câu là nên đưa qua kênh #task hoặc #planning."
+        ),
+    },
+    "planning": {
+        "label": "📋 Planning — Tech Lead & Scrum Master",
+        "prompt": (
+            "📋 **[KÊNH #PLANNING - SENIOR TECH LEAD & SCRUM MASTER]:**\n"
+            "- Khi bàn kế hoạch dự án, chia việc, sprint, lộ trình:\n"
+            "  1. Lập kế hoạch theo Phase / Sprint / Milestone với mốc ngày cụ thể (tính từ thời gian hiện tại).\n"
+            "  2. Bảng phân bổ việc (WBS / checklist): đầu việc, người phụ trách, ước lượng thời gian, độ ưu tiên (P0/P1/P2), phụ thuộc.\n"
+            "  3. Chỉ ra rủi ro và phương án dự phòng. Khi kế hoạch đã chốt, gợi ý Sếp giao task ở kênh #task."
+        ),
+    },
+    "analysis": {
+        "label": "🔍 Analysis — BA/SA",
+        "prompt": (
+            "🔍 **[KÊNH #ANALYSIS - LEAD BUSINESS & SYSTEM ANALYST (BA/SA)]:**\n"
+            "- Khi phân tích yêu cầu, nghiệp vụ, tính năng, thị trường, đối thủ, khách hàng:\n"
+            "  1. Bóc tách yêu cầu chức năng & phi chức năng; mục tiêu kinh doanh và chỉ số đo lường (KPI).\n"
+            "  2. Viết User Stories (`As a... I want... So that...`) kèm Acceptance Criteria (Given/When/Then).\n"
+            "  3. Phân tích luồng xử lý, trường hợp biên, câu hỏi còn mở cần hỏi lại khách hàng/Sếp."
+        ),
+    },
+    "design": {
+        "label": "🎨 Design — Architect & UI/UX",
+        "prompt": (
+            "🎨 **[KÊNH #DESIGN - SYSTEM ARCHITECT & UI/UX DESIGNER]:**\n"
+            "- Khi bàn về thiết kế hệ thống, database, API, giao diện, nhận diện/hình ảnh truyền thông:\n"
+            "  1. Vẽ sơ đồ kiến trúc/luồng bằng **Mermaid** (```mermaid) hoặc ASCII.\n"
+            "  2. Thiết kế database schema, API (endpoint, method, payload, status code).\n"
+            "  3. Góp ý UI/UX & bố cục hình ảnh: phân cấp thông tin, màu sắc, typography, khả năng đọc trên mobile. Nhận ảnh thiết kế thì nhận xét cụ thể từng điểm và đề xuất sửa."
+        ),
+    },
+    "task": {
+        "label": "✅ Task — Quản lý công việc",
+        "prompt": (
+            "✅ **[KÊNH #TASK - PROJECT MANAGER / ĐIỀU PHỐI CÔNG VIỆC]:**\n"
+            "- Đây là kênh giao việc và theo dõi tiến độ. Trả lời ngắn, rõ, hướng hành động.\n"
+            "- Sếp/VIP giao việc -> dùng ACTION assign_task (nội dung task cụ thể, đo được; deadline rõ ràng). Nếu thiếu người nhận hoặc deadline, hỏi lại 1 câu.\n"
+            "- Hỏi tiến độ / ai đang trễ / còn việc gì -> dựa vào [TASK ĐANG CHẠY] trả lời, task quá hạn nêu trước. Cần danh sách đầy đủ thì dùng ACTION task_list.\n"
+            "- Thành viên hỏi về task của mình -> giải thích yêu cầu, gợi ý cách chia nhỏ để làm, nhắc nộp file/link sản phẩm để được duyệt Done."
+        ),
+    },
+    "dev": {
+        "label": "💻 Dev — Full-stack & Bug Hunter",
+        "prompt": (
+            "💻 **[KÊNH DEV - PRINCIPAL FULL-STACK DEVELOPER & BUG HUNTER]:**\n"
+            "- Khi được hỏi về code, lỗi, API hoặc gửi file/ảnh chụp lỗi:\n"
+            "  1. Tìm nguyên nhân gốc, chỉ rõ dòng/logic sai.\n"
+            "  2. Viết lại code hoàn chỉnh, chạy được, xử lý lỗi đầy đủ.\n"
+            "  3. Bọc code trong Markdown block đúng ngôn ngữ, comment chỗ quan trọng."
+        ),
+    },
+}
 
-    if "code" in ch_lower or "dev" in ch_lower or "bug" in ch_lower:
-        return (
-            "\n\n💻 **[CHẾ ĐỘ KÊNH #CODE - PRINCIPAL FULL-STACK DEVELOPER & BUG HUNTER]:**\n"
-            "- Bạn đang ở trong kênh `#code`. Khi Sếp Phát hoặc VIP hỏi về code, lỗi, thuật toán, API, hay gửi file/ảnh chụp lỗi:\n"
-            "  1. Bắt bệnh cực chuẩn (Root Cause Analysis), chỉ rõ dòng code/logic bị lỗi.\n"
-            "  2. Viết lại code hoàn chỉnh (Production-Ready, Clean Code, SOLID, xử lý bất đồng bộ/try-catch đầy đủ, tối ưu hiệu năng O(n)).\n"
-            "  3. Luôn bọc code trong Markdown block chuẩn ngôn ngữ (ví dụ ```python, ```ts, ```sql, ```bash) có comment giải thích những chỗ quan trọng."
-        )
-    if "plan" in ch_lower or "task" in ch_lower or "roadmap" in ch_lower:
-        return (
-            "\n\n📋 **[CHẾ ĐỘ KÊNH #PLANNING - SENIOR TECH LEAD & SCRUM MASTER]:**\n"
-            "- Bạn đang ở trong kênh `#planning`. Khi bàn về kế hoạch dự án, chia việc, sprint, lộ trình:\n"
-            "  1. Lập kế hoạch bài bản theo Agile/Scrum: chia rõ Phase / Sprint / Milestone.\n"
-            "  2. Tạo bảng phân bổ Task (WBS / Checklist), ước lượng thời gian (Estimate/Story Points), độ ưu tiên (P0/P1/P2).\n"
-            "  3. Chỉ ra rủi ro kỹ thuật (Technical Risks) và phương án dự phòng (Mitigation)."
-        )
-    if "analys" in ch_lower or "ba" in ch_lower or "spec" in ch_lower or "req" in ch_lower:
-        return (
-            "\n\n🔍 **[CHẾ ĐỘ KÊNH #ANALYSIS - LEAD BUSINESS & SYSTEM ANALYST (BA/SA)]:**\n"
-            "- Bạn đang ở trong kênh `#analysis`. Khi phân tích yêu cầu, nghiệp vụ, tính năng:\n"
-            "  1. Bóc tách rõ Yêu cầu chức năng (Functional) & Phi chức năng (Non-functional: bảo mật, tải, độ trễ).\n"
-            "  2. Viết User Stories chuẩn (`As a... I want... So that...`) kèm Acceptance Criteria (Given/When/Then).\n"
-            "  3. Phân tích luồng dữ liệu (Data Flow), các trường hợp biên (Edge Cases) và luồng lỗi (Exception Flows)."
-        )
-    if "design" in ch_lower or "arch" in ch_lower or "ui" in ch_lower or "db" in ch_lower:
-        return (
-            "\n\n🎨 **[CHẾ ĐỘ KÊNH #DESIGN - SYSTEM ARCHITECT & DATABASE / UI-UX DESIGNER]:**\n"
-            "- Bạn đang ở trong kênh `#design`. Khi bàn về thiết kế hệ thống, Database, API hoặc giao diện UI/UX:\n"
-            "  1. Thiết kế Kiến trúc hệ thống (System Architecture), vẽ sơ đồ luồng bằng **Mermaid** (` ```mermaid `) hoặc sơ đồ ASCII trực quan.\n"
-            "  2. Thiết kế Database Schema chuẩn chỉnh (ERD, bảng, khoá chính/ngoại, đánh Index tối ưu truy vấn).\n"
-            "  3. Thiết kế chuẩn RESTful API / GraphQL / WebSocket (Endpoint, Method, Request/Response JSON payload, Status Codes) hoặc góp ý bố cục UI/UX hiện đại."
-        )
+# Tên kênh khớp chính xác -> mode (kênh #code là chỗ chat phiếm của team)
+CHANNEL_NAME_MODES: Dict[str, str] = {
+    "code": "chat",
+    "planning": "planning",
+    "analysis": "analysis",
+    "design": "design",
+    "task": "task",
+}
+
+# Kênh mới chưa gán mode: đoán theo từ khoá trong tên
+CHANNEL_KEYWORD_MODES: Tuple[Tuple[Tuple[str, ...], str], ...] = (
+    (("task", "todo", "việc"), "task"),
+    (("plan", "roadmap", "sprint"), "planning"),
+    (("analys", "spec", "req", "research"), "analysis"),
+    (("design", "arch", "ui", "ux"), "design"),
+    (("dev", "bug", "backend", "frontend"), "dev"),
+    (("chat", "general", "chung", "phiem", "phiếm", "off-topic"), "chat"),
+)
+
+
+def resolve_channel_mode(channel: discord.abc.Messageable) -> Optional[str]:
+    # Thread kế thừa mode của kênh cha
+    lookup = channel.parent if isinstance(channel, discord.Thread) and channel.parent else channel
+    channel_id = getattr(lookup, "id", None)
+    if channel_id in config.channel_modes:
+        return config.channel_modes[channel_id]
+    ch_lower = (getattr(lookup, "name", "") or "").lower()
+    if ch_lower in CHANNEL_NAME_MODES:
+        return CHANNEL_NAME_MODES[ch_lower]
+    for keywords, mode in CHANNEL_KEYWORD_MODES:
+        if any(k in ch_lower for k in keywords):
+            return mode
+    return None
+
+
+def get_channel_it_context(channel: discord.abc.Messageable) -> str:
+    """Gắn vai trò phù hợp theo từng kênh trong Server của Sếp Phát."""
+    mode = resolve_channel_mode(channel)
+    if mode and mode in CHANNEL_MODES:
+        return "\n\n" + CHANNEL_MODES[mode]["prompt"]
+    ch_name = getattr(channel, "name", "") or "chat"
     return (
-        f"\n\n🌐 **[KÊNH HIỆN TẠI: #{ch_name or 'chat'}]:** "
-        "Sẵn sàng hỗ trợ Sếp Phát mọi kỹ năng chuyên môn IT (Code, Debug, System Design, Database, DevOps, BA/Planning) lẫn chém gió, quản trị server."
+        f"\n\n🌐 **[KÊNH HIỆN TẠI: #{ch_name}]:** "
+        "Sẵn sàng hỗ trợ Sếp Phát mọi việc: kỹ thuật, kế hoạch, phân tích, truyền thông lẫn chém gió, quản trị server."
     )
 
 
@@ -466,6 +583,74 @@ async def fetch_google_news_vn(query: Optional[str] = None, limit: int = 8) -> L
     return headlines
 
 
+FALLBACK_TEXT_MODELS = (
+    "openai/gpt-oss-120b",
+    "llama-3.3-70b-versatile",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "openai/gpt-oss-20b",
+)
+AI_REASONING_EFFORT = os.getenv("AI_REASONING_EFFORT", "medium").strip().lower()
+RETRYABLE_AI_ERRORS = (
+    openai.RateLimitError,
+    openai.APIConnectionError,
+    openai.APITimeoutError,
+    openai.InternalServerError,
+)
+
+
+async def create_chat_completion(
+    client: AsyncOpenAI,
+    model: str,
+    messages: List[dict],
+    temperature: float,
+    max_tokens: int,
+    allow_fallback: bool = True,
+) -> Any:
+    """Gọi AI có retry khi bị rate limit / lỗi mạng, rồi thử model dự phòng nếu model chính vẫn lỗi."""
+    models_to_try = [model]
+    if allow_fallback:
+        models_to_try += [
+            m
+            for m in FALLBACK_TEXT_MODELS
+            if m != model and (not config.available_models or m in config.available_models)
+        ][:2]
+
+    last_exc: Optional[Exception] = None
+    for candidate in models_to_try:
+        for attempt in range(2):
+            # Model suy luận (gpt-oss) được "nghĩ kỹ" trước khi trả lời -> câu trả lời sâu và chính xác hơn
+            extra_body = (
+                {"reasoning_effort": AI_REASONING_EFFORT}
+                if AI_REASONING_EFFORT and "gpt-oss" in candidate
+                else None
+            )
+            try:
+                return await client.chat.completions.create(
+                    model=candidate,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    extra_body=extra_body,
+                )
+            except openai.BadRequestError as exc:
+                if not extra_body:
+                    raise
+                # Provider không hỗ trợ reasoning_effort -> gọi lại kiểu thường
+                logger.warning("Model %s không nhận reasoning_effort: %s", candidate, exc)
+                return await client.chat.completions.create(
+                    model=candidate,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            except RETRYABLE_AI_ERRORS as exc:
+                last_exc = exc
+                logger.warning("AI lỗi tạm thời (%s, lần %s): %s", candidate, attempt + 1, exc)
+                await asyncio.sleep(1.5 * (attempt + 1))
+    assert last_exc is not None
+    raise last_exc
+
+
 async def ask_ai_Boss(
     prompt: str,
     system_override: Optional[str] = None,
@@ -473,10 +658,11 @@ async def ask_ai_Boss(
 ) -> str:
     """Hàm gọi nhanh AI với phong cách của Boss cho các lệnh Slash Commands."""
     client, text_model, _ = config.get_client_and_models()
-    sys_prompt = system_override or config.system_prompt
-    resp = await client.chat.completions.create(
-        model=text_model,
-        messages=[
+    sys_prompt = (system_override or config.system_prompt) + build_time_context()
+    resp = await create_chat_completion(
+        client,
+        text_model,
+        [
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": prompt},
         ],
@@ -605,6 +791,9 @@ class DiscordAIBot(commands.Bot):
                 )
         except Exception as exc:
             logger.warning("Không lấy được thông tin Owner: %s", exc)
+        await init_task_sheet()
+        asyncio.create_task(task_sheet_sync_loop())
+        asyncio.create_task(scheduler_loop())
         await self.tree.sync()
         logger.info("Đã đồng bộ toàn bộ Slash Commands mới cho Boss!")
 
@@ -683,13 +872,17 @@ async def on_guild_channel_create(channel: discord.abc.GuildChannel) -> None:
 
 def is_user_boss(user: discord.abc.User, guild: Optional[discord.Guild] = None) -> bool:
     """Kiểm tra xem người dùng có phải là Sếp Tổng (Sếp Phát) không."""
+    if user.id in config.boss_user_ids:
+        return True
     if bot.app_owner_id and user.id == bot.app_owner_id:
         return True
     if guild and guild.owner_id and user.id == guild.owner_id:
         return True
-    display = getattr(user, "display_name", user.name).lower()
+    # Đoán theo tên chỉ khi chưa xác định được Sếp bằng ID — tên hiển thị ai cũng đổi được
+    if config.boss_user_ids or bot.app_owner_id:
+        return False
     uname = user.name.lower()
-    return "phát" in display or "phat" in display or "phat" in uname
+    return "phat" in uname or "phát" in uname
 
 
 def is_user_authorized(
@@ -933,7 +1126,7 @@ def parse_task_deadline(text: str) -> Tuple[int, str]:
     Hỗ trợ: phút, tiếng/giờ, ngày, thứ trong tuần, hôm nay, ngày mai, trong tuần này.
     Nếu không có mốc thời gian -> mặc định 24 giờ.
     """
-    now = datetime.datetime.now()
+    now = now_vn()
     text_lower = text.lower()
 
     # 1. Phút (ví dụ: 15 phút, 30p, 45 min)
@@ -998,24 +1191,366 @@ def parse_task_deadline(text: str) -> Tuple[int, str]:
     return int(target.timestamp()), "24 giờ tới (mặc định)"
 
 
-def _load_tasks() -> Dict[str, Any]:
-    """Tải danh sách các task đang hoạt động từ file active_tasks.json."""
-    if TASKS_FILE.exists():
+# ================= LƯU DỮ LIỆU: GOOGLE SHEET (NGUỒN CHÍNH) + FILE LOCAL (DỰ PHÒNG) =================
+# Mỗi bảng (Tasks, Trí nhớ, Nhắc việc, Cài đặt) là 1 tab trong cùng Google Sheet.
+# Bot giữ dữ liệu trong RAM, mọi thay đổi ghi ra file local ngay và đẩy lên Sheet sau vài giây.
+# Định kỳ đọc lại Sheet để nhận chỉnh sửa tay (đổi hạn, đổi trạng thái, thêm dòng mới...).
+
+SHEET_DATE_FORMAT = "%d/%m/%Y %H:%M"
+SHEET_PUSH_INTERVAL = 10
+SHEET_PULL_INTERVAL = 180
+
+
+def _extract_sheet_id(raw: str) -> str:
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", raw)
+    return m.group(1) if m else raw.strip()
+
+
+TASK_SHEET_ID = _extract_sheet_id(os.getenv("TASK_SHEET_ID", ""))
+TASK_SHEET_TAB = os.getenv("TASK_SHEET_TAB", "Tasks").strip() or "Tasks"
+
+
+def task_sheet_url() -> Optional[str]:
+    return f"https://docs.google.com/spreadsheets/d/{TASK_SHEET_ID}" if TASK_SHEET_ID else None
+
+
+def _fmt_sheet_time(ts: Any) -> str:
+    try:
+        return datetime.datetime.fromtimestamp(int(ts), VN_TZ).strftime(SHEET_DATE_FORMAT) if ts else ""
+    except (TypeError, ValueError):
+        return ""
+
+
+def _parse_sheet_time(text: str) -> int:
+    text = (text or "").strip()
+    for fmt in (SHEET_DATE_FORMAT, "%d/%m/%Y %H:%M:%S", "%d/%m/%Y", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
-            return json.loads(TASKS_FILE.read_text(encoding="utf-8"))
+            dt = datetime.datetime.strptime(text, fmt)
+            if fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                dt = dt.replace(hour=23, minute=59)
+            return int(dt.replace(tzinfo=VN_TZ).timestamp())
+        except ValueError:
+            continue
+    return 0
+
+
+def _parse_id_list(text: str) -> List[int]:
+    return [int(x) for x in re.findall(r"\d{5,}", text or "")]
+
+
+def _pad_row(row: List[str], width: int) -> List[str]:
+    return [c.strip() for c in (list(row) + [""] * width)[:width]]
+
+
+class SheetTable:
+    """Một bảng dữ liệu đồng bộ 2 chiều giữa RAM, file local và 1 tab Google Sheet."""
+
+    def __init__(
+        self,
+        tab: str,
+        headers: List[str],
+        local_file: Path,
+        to_rows: Any,
+        from_rows: Any,
+        empty: Any,
+    ) -> None:
+        self.tab = tab
+        self.headers = headers
+        self.local_file = local_file
+        self.to_rows = to_rows  # data -> List[List[str]]
+        self.from_rows = from_rows  # List[List[str]] -> data
+        self.empty = empty
+        self.data: Any = None
+        self.dirty = False
+        self.ws: Any = None
+
+    def load(self) -> Any:
+        if self.data is None:
+            self.data = self._read_local()
+        return self.data
+
+    def save(self, data: Any) -> None:
+        self.data = data
+        self.dirty = True
+        try:
+            self.local_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         except Exception as exc:
-            logger.warning("Không đọc được file active_tasks.json: %s", exc)
-    return {}
+            logger.warning("Không lưu được file %s: %s", self.local_file.name, exc)
+
+    def _read_local(self) -> Any:
+        if self.local_file.exists():
+            try:
+                return json.loads(self.local_file.read_text(encoding="utf-8"))
+            except Exception as exc:
+                logger.warning("Không đọc được file %s: %s", self.local_file.name, exc)
+        return self.empty()
+
+    # --- Các hàm dưới chạy trong thread (gspread là thư viện sync) ---
+    def pull_sync(self) -> Tuple[Any, bool]:
+        """Đọc Sheet. Trả về (dữ liệu, cần_ghi_lại) — cần ghi lại khi bot chuẩn hoá/cấp mã cho dòng nhập tay."""
+        values = self.ws.get_all_values()
+        width = len(self.headers)
+        raw_rows = [_pad_row(r, width) for r in values[1:] if any(c.strip() for c in r)]
+        data = self.from_rows(raw_rows)
+        normalized = [_pad_row([str(c) for c in r], width) for r in self.to_rows(data)]
+        header_ok = bool(values) and _pad_row(values[0], width) == self.headers
+        return data, (normalized != raw_rows or not header_ok)
+
+    def push_sync(self, data: Any) -> None:
+        rows = [self.headers] + self.to_rows(data)
+        self.ws.clear()
+        # RAW để ID Discord (18 số) giữ nguyên dạng chữ, không bị Sheets làm tròn
+        self.ws.update(range_name="A1", values=rows, value_input_option="RAW")
+        try:
+            self.ws.freeze(rows=1)
+        except Exception:
+            pass
+
+
+# ---------- Bảng Tasks ----------
+TASK_SHEET_HEADERS = [
+    "Mã task", "Giai đoạn", "Nội dung", "Người nhận", "Hạn chót", "Trạng thái", "Người giao",
+    "Ngày giao", "File/Link đã nộp", "Ngày nộp",
+    "ID người nhận", "ID người giao", "ID kênh", "ID server", "Đã nhắc sắp hạn", "Đã báo quá hạn",
+]
+TASK_STATUS_TO_VN = {"pending": "Đang làm", "completed": "Hoàn thành", "cancelled": "Huỷ"}
+TASK_STATUS_FROM_VN = {
+    "đang làm": "pending", "pending": "pending", "": "pending",
+    "hoàn thành": "completed", "done": "completed", "xong": "completed", "completed": "completed",
+    "huỷ": "cancelled", "hủy": "cancelled", "cancelled": "cancelled",
+}
+# Task nhập tay trên Sheet được cấp mã tạm "S..." -> bot thông báo lên Discord rồi đổi sang mã tin nhắn
+SHEET_TASK_PREFIX = "S"
+
+
+def _task_to_row(t: Dict[str, Any]) -> List[str]:
+    return [
+        str(t.get("task_id", "")),
+        str(t.get("phase") or ""),
+        str(t.get("task_desc", "")),
+        ", ".join(t.get("assigned_names", [])),
+        _fmt_sheet_time(t.get("deadline_ts")),
+        TASK_STATUS_TO_VN.get(t.get("status", "pending"), "Đang làm"),
+        str(t.get("creator_name", "")),
+        _fmt_sheet_time(t.get("created_at")),
+        str(t.get("submitted_file") or ""),
+        _fmt_sheet_time(t.get("submitted_at")),
+        ", ".join(str(uid) for uid in t.get("assigned_user_ids", [])),
+        str(t.get("creator_id") or ""),
+        str(t.get("channel_id") or ""),
+        str(t.get("guild_id") or ""),
+        "x" if t.get("warned_soon") else "",
+        "x" if t.get("warned_overdue") else "",
+    ]
+
+
+def _row_to_task(row: List[str], row_index: int) -> Optional[Dict[str, Any]]:
+    (task_id, phase, desc, names, deadline, status, creator_name, created, submitted_file,
+     submitted_at, assigned_ids, creator_id, channel_id, guild_id, warned_soon, warned_overdue) = row
+    if not desc:
+        return None
+    now_ts = int(now_vn().timestamp())
+    if not task_id:
+        task_id = f"{SHEET_TASK_PREFIX}{now_ts}{row_index:03d}"
+    return {
+        "task_id": task_id,
+        "phase": phase,
+        "message_id": int(task_id) if task_id.isdigit() else 0,
+        "channel_id": int(channel_id) if channel_id.isdigit() else None,
+        "guild_id": int(guild_id) if guild_id.isdigit() else None,
+        "creator_id": int(creator_id) if creator_id.isdigit() else None,
+        "creator_name": creator_name,
+        "assigned_user_ids": _parse_id_list(assigned_ids),
+        "assigned_names": [n.strip() for n in names.split(",") if n.strip()],
+        "task_desc": desc,
+        "deadline_ts": _parse_sheet_time(deadline),
+        "status": TASK_STATUS_FROM_VN.get(status.lower(), "pending"),
+        "created_at": _parse_sheet_time(created) or now_ts,
+        "submitted_file": submitted_file or None,
+        "submitted_at": _parse_sheet_time(submitted_at) or None,
+        "submitted_by_id": None,
+        "warned_soon": bool(warned_soon),
+        "warned_overdue": bool(warned_overdue),
+    }
+
+
+def _tasks_to_rows(tasks: Dict[str, Any]) -> List[List[str]]:
+    ordered = sorted(tasks.values(), key=lambda t: int(t.get("created_at") or 0))
+    return [_task_to_row(t) for t in ordered]
+
+
+def _tasks_from_rows(rows: List[List[str]]) -> Dict[str, Any]:
+    tasks: Dict[str, Any] = {}
+    for idx, row in enumerate(rows, start=2):
+        t = _row_to_task(row, idx)
+        if t:
+            tasks[t["task_id"]] = t
+    return tasks
+
+
+# ---------- Bảng Trí nhớ ----------
+MEMORY_SHEET_HEADERS = ["Mã", "Nội dung ghi nhớ", "Người ghi", "Ngày ghi", "ID server"]
+
+
+def _memories_to_rows(memories: List[Dict[str, Any]]) -> List[List[str]]:
+    return [
+        [str(m.get("id", "")), str(m.get("text", "")), str(m.get("by", "")),
+         _fmt_sheet_time(m.get("at")), str(m.get("guild_id") or "")]
+        for m in memories
+    ]
+
+
+def _memories_from_rows(rows: List[List[str]]) -> List[Dict[str, Any]]:
+    memories: List[Dict[str, Any]] = []
+    next_id = max((int(r[0]) for r in rows if r[0].isdigit()), default=0) + 1
+    for mem_id, text, by, at, guild_id in rows:
+        if not text:
+            continue
+        if not mem_id.isdigit():
+            mem_id, next_id = str(next_id), next_id + 1
+        memories.append({
+            "id": int(mem_id),
+            "text": text,
+            "by": by or "Sheet",
+            "at": _parse_sheet_time(at) or int(now_vn().timestamp()),
+            "guild_id": int(guild_id) if guild_id.isdigit() else None,
+        })
+    return memories
+
+
+# ---------- Bảng Nhắc việc ----------
+REMINDER_SHEET_HEADERS = ["Thời gian nhắc", "Nội dung", "Người nhận", "ID người nhận", "ID kênh"]
+
+
+def _reminders_to_rows(reminders: List[Dict[str, Any]]) -> List[List[str]]:
+    ordered = sorted(reminders, key=lambda r: int(r.get("due_ts") or 0))
+    return [
+        [_fmt_sheet_time(r.get("due_ts")), str(r.get("text", "")), str(r.get("user_name") or ""),
+         str(r.get("user_id") or ""), str(r.get("channel_id") or "")]
+        for r in ordered
+    ]
+
+
+def _reminders_from_rows(rows: List[List[str]]) -> List[Dict[str, Any]]:
+    reminders: List[Dict[str, Any]] = []
+    for due, text, user_name, user_id, channel_id in rows:
+        due_ts = _parse_sheet_time(due)
+        if not text or not due_ts:
+            continue
+        reminders.append({
+            "due_ts": due_ts,
+            "text": text,
+            "user_name": user_name,
+            "user_id": int(user_id) if user_id.isdigit() else None,
+            "channel_id": int(channel_id) if channel_id.isdigit() else None,
+        })
+    return reminders
+
+
+# ---------- Bảng Cài đặt (giai đoạn hiện tại, mốc gửi báo cáo...) ----------
+SETTINGS_SHEET_HEADERS = ["Khoá", "Giá trị"]
+
+
+def _settings_to_rows(settings: Dict[str, str]) -> List[List[str]]:
+    return [[k, str(v)] for k, v in settings.items()]
+
+
+def _settings_from_rows(rows: List[List[str]]) -> Dict[str, str]:
+    return {k: v for k, v in rows if k}
+
+
+TASK_TABLE = SheetTable(TASK_SHEET_TAB, TASK_SHEET_HEADERS, TASKS_FILE, _tasks_to_rows, _tasks_from_rows, dict)
+MEMORY_TABLE = SheetTable("Trí nhớ", MEMORY_SHEET_HEADERS, MEMORY_FILE, _memories_to_rows, _memories_from_rows, list)
+REMINDER_TABLE = SheetTable("Nhắc việc", REMINDER_SHEET_HEADERS, REMINDERS_FILE, _reminders_to_rows, _reminders_from_rows, list)
+SETTINGS_TABLE = SheetTable("Cài đặt", SETTINGS_SHEET_HEADERS, Path(__file__).parent / "settings.json", _settings_to_rows, _settings_from_rows, dict)
+SHEET_TABLES = (TASK_TABLE, MEMORY_TABLE, REMINDER_TABLE, SETTINGS_TABLE)
+
+
+def get_setting(key: str, default: str = "") -> str:
+    return str(SETTINGS_TABLE.load().get(key, default))
+
+
+def set_setting(key: str, value: str) -> None:
+    settings = SETTINGS_TABLE.load()
+    settings[key] = value
+    SETTINGS_TABLE.save(settings)
+
+
+def _load_tasks() -> Dict[str, Any]:
+    """Danh sách task hiện tại (cache trong RAM, đồng bộ với Google Sheet)."""
+    return TASK_TABLE.load()
 
 
 def _save_tasks(tasks: Dict[str, Any]) -> None:
-    """Lưu danh sách task vào file active_tasks.json."""
+    TASK_TABLE.save(tasks)
+
+
+def _open_worksheets_sync() -> None:
+    """Kết nối Google Sheet bằng Service Account và mở (hoặc tạo) từng tab."""
+    import gspread
+
+    raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    key_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
+    if raw_json:
+        gc = gspread.service_account_from_dict(json.loads(raw_json))
+    elif key_file:
+        gc = gspread.service_account(filename=key_file)
+    else:
+        raise RuntimeError("Thiếu GOOGLE_SERVICE_ACCOUNT_JSON hoặc GOOGLE_SERVICE_ACCOUNT_FILE")
+    spreadsheet = gc.open_by_key(TASK_SHEET_ID)
+    for table in SHEET_TABLES:
+        try:
+            table.ws = spreadsheet.worksheet(table.tab)
+        except gspread.WorksheetNotFound:
+            table.ws = spreadsheet.add_worksheet(title=table.tab, rows=200, cols=len(table.headers))
+
+
+async def init_task_sheet() -> None:
+    """Khởi động: kết nối Sheet và lấy dữ liệu từ Sheet (tab trống thì chuyển dữ liệu local lên)."""
+    if not TASK_SHEET_ID:
+        logger.info("Chưa cấu hình TASK_SHEET_ID -> dữ liệu chỉ lưu file local.")
+        return
     try:
-        TASKS_FILE.write_text(
-            json.dumps(tasks, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+        await asyncio.to_thread(_open_worksheets_sync)
     except Exception as exc:
-        logger.warning("Không lưu được file active_tasks.json: %s", exc)
+        for table in SHEET_TABLES:
+            table.ws = None
+        logger.warning("Không kết nối được Google Sheet, dùng file local: %s", exc)
+        return
+    for table in SHEET_TABLES:
+        try:
+            data, _ = await asyncio.to_thread(table.pull_sync)
+            table.data = data if data else table.load()
+            table.dirty = True  # ghi header + chuẩn hoá ngay lần đầu
+            logger.info("📊 Đã đồng bộ tab '%s' (%s dòng).", table.tab, len(table.data))
+        except Exception as exc:
+            logger.warning("Lỗi đọc tab '%s': %s", table.tab, exc)
+
+
+async def task_sheet_sync_loop() -> None:
+    elapsed = 0
+    while True:
+        await asyncio.sleep(SHEET_PUSH_INTERVAL)
+        elapsed += SHEET_PUSH_INTERVAL
+        do_pull = elapsed >= SHEET_PULL_INTERVAL
+        if do_pull:
+            elapsed = 0
+        for table in SHEET_TABLES:
+            if table.ws is None:
+                continue
+            try:
+                if table.dirty:
+                    table.dirty = False
+                    snapshot = json.loads(json.dumps(table.load()))
+                    await asyncio.to_thread(table.push_sync, snapshot)
+                elif do_pull:
+                    data, needs_push = await asyncio.to_thread(table.pull_sync)
+                    if not table.dirty:  # không ghi đè thay đổi local vừa phát sinh trong lúc đọc
+                        table.data = data
+                        table.dirty = needs_push
+            except Exception as exc:
+                table.dirty = True
+                logger.warning("Lỗi đồng bộ tab '%s' (sẽ thử lại): %s", table.tab, exc)
 
 
 def record_new_task(
@@ -1028,11 +1563,13 @@ def record_new_task(
     assigned_names: List[str],
     task_desc: str,
     deadline_ts: int,
+    phase: str = "",
 ) -> None:
     """Ghi nhận một task mới được giao vào danh sách theo dõi."""
     tasks = _load_tasks()
     tasks[str(message_id)] = {
         "task_id": str(message_id),
+        "phase": phase,
         "message_id": message_id,
         "channel_id": channel_id,
         "guild_id": guild_id,
@@ -1043,7 +1580,7 @@ def record_new_task(
         "task_desc": task_desc,
         "deadline_ts": deadline_ts,
         "status": "pending",
-        "created_at": int(datetime.datetime.now().timestamp()),
+        "created_at": int(now_vn().timestamp()),
         "submitted_file": None,
         "submitted_at": None,
         "submitted_by_id": None,
@@ -1089,7 +1626,7 @@ def mark_task_completed(
         t = tasks[task_id]
         t["status"] = "completed"
         t["submitted_file"] = file_info
-        t["submitted_at"] = int(datetime.datetime.now().timestamp())
+        t["submitted_at"] = int(now_vn().timestamp())
         t["submitted_by_id"] = user_id
         _save_tasks(tasks)
         return t
@@ -1100,6 +1637,508 @@ def get_task_by_id(task_id: Union[int, str]) -> Optional[Dict[str, Any]]:
     """Lấy thông tin task theo ID tin nhắn task."""
     tasks = _load_tasks()
     return tasks.get(str(task_id))
+
+
+# ================= TRÍ NHỚ DÀI HẠN CỦA TEAM =================
+
+MAX_MEMORY_ENTRIES = 80
+
+
+def add_team_memory(text: str, author_name: str, guild_id: Optional[int]) -> int:
+    """Ghi nhớ một sự thật/quy định/thông tin lâu dài của team. Trả về ID ghi nhớ."""
+    memories = MEMORY_TABLE.load()
+    next_id = max((int(m.get("id", 0)) for m in memories), default=0) + 1
+    memories.append(
+        {
+            "id": next_id,
+            "guild_id": guild_id,
+            "text": text.strip()[:500],
+            "by": author_name,
+            "at": int(now_vn().timestamp()),
+        }
+    )
+    MEMORY_TABLE.save(memories[-MAX_MEMORY_ENTRIES:])
+    return next_id
+
+
+def remove_team_memory(query: str, guild_id: Optional[int]) -> List[str]:
+    """Xoá ghi nhớ theo ID hoặc theo đoạn nội dung khớp. Trả về các nội dung đã xoá."""
+    memories = MEMORY_TABLE.load()
+    q = query.strip().lower().lstrip("#")
+    removed: List[str] = []
+    kept: List[Dict[str, Any]] = []
+    for m in memories:
+        same_guild = m.get("guild_id") in (None, guild_id)
+        matched = q and (q == str(m.get("id")) or q in str(m.get("text", "")).lower())
+        if same_guild and matched:
+            removed.append(str(m.get("text", "")))
+        else:
+            kept.append(m)
+    if removed:
+        MEMORY_TABLE.save(kept)
+    return removed
+
+
+def get_team_memories(guild_id: Optional[int]) -> List[Dict[str, Any]]:
+    return [
+        m for m in MEMORY_TABLE.load() if m.get("guild_id") in (None, guild_id)
+    ]
+
+
+def build_memory_context(guild_id: Optional[int]) -> str:
+    memories = get_team_memories(guild_id)
+    if not memories:
+        return ""
+    lines = [f"- (#{m.get('id')}) {m.get('text')}" for m in memories[-40:]]
+    return (
+        "\n\n[🧠 TRÍ NHỚ DÀI HẠN CỦA TEAM — thông tin Sếp/VIP đã dặn ghi nhớ, dùng khi liên quan]:\n"
+        + "\n".join(lines)
+    )
+
+
+# ================= NHẮC VIỆC & THEO DÕI DEADLINE (LƯU FILE, SỐNG SÓT KHI RESTART) =================
+
+
+def add_reminder(
+    channel_id: int, user_id: int, text: str, due_ts: int, user_name: str = ""
+) -> None:
+    reminders = REMINDER_TABLE.load()
+    reminders.append(
+        {"channel_id": channel_id, "user_id": user_id, "user_name": user_name, "text": text, "due_ts": due_ts}
+    )
+    REMINDER_TABLE.save(reminders)
+
+
+def get_pending_tasks(
+    guild_id: Optional[int] = None,
+    user_id: Optional[int] = None,
+    phase: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    result = []
+    phase_key = (phase or "").strip().lower()
+    for t in _load_tasks().values():
+        if t.get("status") != "pending":
+            continue
+        if phase_key and phase_key not in str(t.get("phase") or "").lower():
+            continue
+        if guild_id is not None and t.get("guild_id") not in (None, guild_id):
+            continue
+        if user_id is not None and user_id not in t.get("assigned_user_ids", []):
+            continue
+        result.append(t)
+    result.sort(key=lambda x: x.get("deadline_ts", 0))
+    return result
+
+
+def format_task_line(t: Dict[str, Any]) -> str:
+    now_ts = int(now_vn().timestamp())
+    deadline_ts = int(t.get("deadline_ts", 0))
+    overdue = " 🔴 **QUÁ HẠN**" if deadline_ts and deadline_ts < now_ts else ""
+    names = ", ".join(t.get("assigned_names", [])) or "?"
+    deadline_str = f"<t:{deadline_ts}:R>" if deadline_ts else "chưa có hạn"
+    phase = f"[{t['phase']}] " if t.get("phase") else ""
+    return (
+        f"• `#{str(t.get('task_id'))[-5:]}` {phase}**{t.get('task_desc')}** — 🎯 {names} — "
+        f"⏳ {deadline_str}{overdue}"
+    )
+
+
+def build_task_context(guild_id: Optional[int]) -> str:
+    """Tóm tắt task đang chạy để AI trả lời được các câu như 'ai đang trễ deadline?'."""
+    pending = get_pending_tasks(guild_id)
+    current_phase = get_setting("current_phase")
+    phase_note = f"\n\n[🏷️ GIAI ĐOẠN DỰ ÁN HIỆN TẠI]: {current_phase}" if current_phase else ""
+    if not pending:
+        return phase_note + "\n\n[📋 TASK ĐANG CHẠY]: Hiện không có task nào đang chờ nộp."
+    now_ts = int(now_vn().timestamp())
+    lines = []
+    for t in pending[:25]:
+        deadline_ts = int(t.get("deadline_ts", 0))
+        deadline_str = (
+            datetime.datetime.fromtimestamp(deadline_ts, VN_TZ).strftime("%H:%M %d/%m")
+            if deadline_ts else "chưa có hạn"
+        )
+        state = "QUÁ HẠN" if deadline_ts and deadline_ts < now_ts else "đang làm"
+        phase = f" | giai đoạn: {t['phase']}" if t.get("phase") else ""
+        lines.append(
+            f"- [mã {str(t.get('task_id'))[-5:]}] {t.get('task_desc')} | người nhận: "
+            f"{', '.join(t.get('assigned_names', []))} | hạn: {deadline_str} ({state}){phase}"
+        )
+    return phase_note + "\n\n[📋 TASK ĐANG CHẠY TRONG SERVER]:\n" + "\n".join(lines)
+
+
+def find_pending_task(query: str, guild_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    """Tìm task pending theo mã (5 số cuối) hoặc theo đoạn mô tả."""
+    q = query.strip().lower().lstrip("#")
+    if not q:
+        return None
+    for t in get_pending_tasks(guild_id):
+        if str(t.get("task_id", "")).endswith(q) or q in str(t.get("task_desc", "")).lower():
+            return t
+    return None
+
+
+def set_task_status(task_id: str, status: str) -> None:
+    tasks = _load_tasks()
+    if task_id in tasks:
+        tasks[task_id]["status"] = status
+        _save_tasks(tasks)
+
+
+async def _get_messageable(channel_id: int) -> Optional[discord.abc.Messageable]:
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except Exception:
+            return None
+    return channel  # type: ignore[return-value]
+
+
+# ================= GHÉP TÊN -> THÀNH VIÊN, KÊNH TASK, THÔNG BÁO TASK TỪ SHEET =================
+
+
+def _norm_name(text: str) -> str:
+    text = unicodedata.normalize("NFD", (text or "").replace("đ", "d").replace("Đ", "D"))
+    return "".join(c for c in text if unicodedata.category(c) != "Mn").lower().strip().lstrip("@")
+
+
+def find_member_by_name(guild: discord.Guild, name: str) -> Optional[discord.Member]:
+    """Tìm thành viên theo tên (không phân biệt dấu/hoa thường). Chỉ trả về khi khớp duy nhất 1 người."""
+    target = _norm_name(name)
+    if not target:
+        return None
+    members = [m for m in guild.members if not m.bot]
+
+    def names_of(m: discord.Member) -> Set[str]:
+        return {_norm_name(m.display_name), _norm_name(m.name), _norm_name(m.global_name or "")} - {""}
+
+    exact = [m for m in members if target in names_of(m)]
+    if len(exact) == 1:
+        return exact[0]
+    partial = [m for m in members if any(target in n for n in names_of(m))]
+    return partial[0] if len(partial) == 1 else None
+
+
+def get_task_guild(guild_id: Optional[int]) -> Optional[discord.Guild]:
+    if guild_id:
+        return bot.get_guild(guild_id)
+    return bot.guilds[0] if len(bot.guilds) == 1 else None
+
+
+REPORT_CHANNEL_ID = int(os.getenv("REPORT_CHANNEL_ID", "0") or 0)
+
+
+def find_task_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
+    """Kênh giao việc của server: REPORT_CHANNEL_ID nếu có, nếu không lấy kênh đang ở chế độ 'task'."""
+    if REPORT_CHANNEL_ID:
+        ch = guild.get_channel(REPORT_CHANNEL_ID)
+        if isinstance(ch, discord.TextChannel):
+            return ch
+    task_channels = [ch for ch in guild.text_channels if resolve_channel_mode(ch) == "task"]
+    task_channels.sort(key=lambda ch: (ch.name.lower() != "task", ch.position))
+    return task_channels[0] if task_channels else None
+
+
+def build_task_embed(
+    task_desc: str,
+    deadline_ts: int,
+    creator_text: str,
+    mention_str: str,
+    phase: str = "",
+    is_reminder: bool = False,
+    footer_name: str = "",
+) -> discord.Embed:
+    deadline_line = (
+        f"<t:{deadline_ts}:F> (<t:{deadline_ts}:R>)" if deadline_ts else "Chưa có hạn — Sếp bổ sung trên bảng task nhé"
+    )
+    phase_line = f"🏷️ **Giai đoạn:** {phase}\n" if phase else ""
+    embed = discord.Embed(
+        title="🔔 NHẮC NHỞ CÔNG VIỆC / TASK!" if is_reminder else "📋 TASK MỚI ĐƯỢC GIAO!",
+        description=(
+            f"📝 **Nội dung:** {task_desc}\n\n"
+            f"{phase_line}"
+            f"⏳ **Hạn chót & Đếm ngược:** {deadline_line}\n\n"
+            f"👤 **Người giao/nhắc:** {creator_text}\n"
+            f"🎯 **Người nhận:** {mention_str}\n\n"
+            f"📁 **Quy tắc duyệt Done:** Đính kèm FILE làm việc (tài liệu/code/báo cáo hoặc link sản phẩm) vào kênh này thì Boss mới tự động tick Done!"
+        ),
+        color=discord.Color.gold() if is_reminder else discord.Color.orange(),
+    )
+    embed.set_footer(
+        text=f"Bởi {footer_name or 'Boss'} • ⚠️ BẮT BUỘC nộp kèm FILE làm việc để hoàn thành! 📁"
+    )
+    return embed
+
+
+async def announce_sheet_tasks() -> None:
+    """Task nhập tay trên Google Sheet (mã 'S...'): ghép tên -> thành viên, đăng lên kênh task, đổi sang mã tin nhắn."""
+    tasks = _load_tasks()
+    new_ids = [
+        tid for tid, t in tasks.items()
+        if tid.startswith(SHEET_TASK_PREFIX) and t.get("status") == "pending"
+    ]
+    for old_id in new_ids:
+        t = tasks.get(old_id)
+        if not t:
+            continue
+        guild = get_task_guild(t.get("guild_id"))
+        if not guild:
+            continue
+        channel = guild.get_channel(t["channel_id"]) if t.get("channel_id") else find_task_channel(guild)
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            continue
+
+        user_ids = list(t.get("assigned_user_ids", []))
+        display_names: List[str] = []
+        unresolved: List[str] = []
+        for name in t.get("assigned_names", []):
+            member = find_member_by_name(guild, name)
+            if member:
+                if member.id not in user_ids:
+                    user_ids.append(member.id)
+                display_names.append(member.display_name)
+            else:
+                unresolved.append(name)
+                display_names.append(name)
+        mention_str = " ".join(f"<@{uid}>" for uid in user_ids) or "(chưa rõ người nhận)"
+        if unresolved:
+            mention_str += f" *(không tìm thấy thành viên: {', '.join(unresolved)})*"
+        creator_text = f"<@{t['creator_id']}>" if t.get("creator_id") else (t.get("creator_name") or "Bảng task")
+
+        embed = build_task_embed(
+            t.get("task_desc", ""), int(t.get("deadline_ts") or 0), creator_text, mention_str,
+            phase=t.get("phase", ""), footer_name=t.get("creator_name") or "Bảng task",
+        )
+        msg = await channel.send(content=f"📣 {mention_str} — có task mới từ bảng task nè! 🔥", embed=embed)
+        try:
+            await msg.add_reaction("🔄")
+        except Exception:
+            pass
+
+        tasks = _load_tasks()  # lấy lại phòng khi vừa có đồng bộ trong lúc gửi
+        t = tasks.pop(old_id, t)
+        t.update(
+            task_id=str(msg.id),
+            message_id=msg.id,
+            channel_id=channel.id,
+            guild_id=guild.id,
+            assigned_user_ids=user_ids,
+            assigned_names=display_names,
+        )
+        tasks[str(msg.id)] = t
+        _save_tasks(tasks)
+
+
+# ================= BÁO CÁO TỰ ĐỘNG (SÁNG HẰNG NGÀY & CUỐI TUẦN) =================
+
+DAILY_REPORT_TIME = os.getenv("DAILY_REPORT_TIME", "08:30").strip()
+WEEKLY_REPORT_TIME = os.getenv("WEEKLY_REPORT_TIME", "17:30").strip()
+WEEKLY_REPORT_WEEKDAY = 4  # Thứ Sáu
+
+
+def _parse_hhmm(text: str) -> Optional[Tuple[int, int]]:
+    m = re.fullmatch(r"(\d{1,2})[:h](\d{2})", text)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _field_text(lines: List[str], empty: str = "—") -> str:
+    out = ""
+    for line in lines:
+        if len(out) + len(line) + 1 > 1000:
+            out += "\n…"
+            break
+        out += line + "\n"
+    return out.strip() or empty
+
+
+def _task_short(t: Dict[str, Any], show_deadline: bool = True) -> str:
+    who = ", ".join(t.get("assigned_names", [])) or "?"
+    deadline_ts = int(t.get("deadline_ts") or 0)
+    tail = f" — <t:{deadline_ts}:R>" if show_deadline and deadline_ts else ""
+    phase = f"[{t['phase']}] " if t.get("phase") else ""
+    return f"• {phase}**{t.get('task_desc')}** — {who}{tail}"
+
+
+def build_daily_report(guild_id: Optional[int]) -> discord.Embed:
+    now = now_vn()
+    now_ts = int(now.timestamp())
+    end_today = int(now.replace(hour=23, minute=59, second=59).timestamp())
+    in_3_days = now_ts + 3 * 86400
+    pending = get_pending_tasks(guild_id)
+    overdue = [t for t in pending if t.get("deadline_ts") and t["deadline_ts"] < now_ts]
+    today = [t for t in pending if t.get("deadline_ts") and now_ts <= t["deadline_ts"] <= end_today]
+    upcoming = [t for t in pending if t.get("deadline_ts") and end_today < t["deadline_ts"] <= in_3_days]
+    no_deadline = [t for t in pending if not t.get("deadline_ts")]
+
+    workload: Dict[str, int] = defaultdict(int)
+    for t in pending:
+        for name in t.get("assigned_names", []) or ["?"]:
+            workload[name] += 1
+    workload_lines = [
+        f"• {name}: **{count}** task" for name, count in sorted(workload.items(), key=lambda x: -x[1])
+    ]
+
+    phase = get_setting("current_phase")
+    embed = discord.Embed(
+        title=f"☀️ BÁO CÁO SÁNG — {WEEKDAY_VN[now.weekday()]} {now.strftime('%d/%m')}",
+        description=(
+            (f"🏷️ Giai đoạn hiện tại: **{phase}**\n" if phase else "")
+            + f"Đang chạy **{len(pending)}** task — 🔴 quá hạn **{len(overdue)}** — 📌 hạn hôm nay **{len(today)}**"
+        ),
+        color=discord.Color.red() if overdue else discord.Color.blue(),
+    )
+    embed.add_field(name="🔴 Quá hạn", value=_field_text([_task_short(t) for t in overdue], "Không có 🎉"), inline=False)
+    embed.add_field(name="📌 Hạn hôm nay", value=_field_text([_task_short(t) for t in today], "Không có"), inline=False)
+    embed.add_field(name="🗓️ 3 ngày tới", value=_field_text([_task_short(t) for t in upcoming], "Không có"), inline=False)
+    if no_deadline:
+        embed.add_field(name="❔ Chưa có hạn", value=_field_text([_task_short(t, False) for t in no_deadline]), inline=False)
+    if workload_lines:
+        embed.add_field(name="👥 Khối lượng việc", value=_field_text(workload_lines), inline=False)
+    if task_sheet_url():
+        embed.add_field(name="📊 Bảng task", value=task_sheet_url(), inline=False)
+    return embed
+
+
+def build_weekly_report(guild_id: Optional[int]) -> discord.Embed:
+    now = now_vn()
+    now_ts = int(now.timestamp())
+    week_ago = now_ts - 7 * 86400
+    all_tasks = [
+        t for t in _load_tasks().values() if guild_id is None or t.get("guild_id") in (None, guild_id)
+    ]
+    done = [
+        t for t in all_tasks
+        if t.get("status") == "completed" and int(t.get("submitted_at") or 0) >= week_ago
+    ]
+    on_time = [t for t in done if not t.get("deadline_ts") or int(t["submitted_at"]) <= int(t["deadline_ts"])]
+    new_tasks = [t for t in all_tasks if int(t.get("created_at") or 0) >= week_ago]
+    pending = [t for t in all_tasks if t.get("status") == "pending"]
+    overdue = [t for t in pending if t.get("deadline_ts") and t["deadline_ts"] < now_ts]
+
+    per_person: Dict[str, List[int]] = defaultdict(lambda: [0, 0])  # [hoàn thành, còn tồn]
+    for t in done:
+        for name in t.get("assigned_names", []) or ["?"]:
+            per_person[name][0] += 1
+    for t in pending:
+        for name in t.get("assigned_names", []) or ["?"]:
+            per_person[name][1] += 1
+    person_lines = [
+        f"• {name}: ✅ {d} xong — ⏳ {p} còn tồn"
+        for name, (d, p) in sorted(per_person.items(), key=lambda x: (-x[1][0], x[0]))
+    ]
+    rate = f"{round(100 * len(on_time) / len(done))}%" if done else "—"
+
+    embed = discord.Embed(
+        title=f"📈 TỔNG KẾT TUẦN — {now.strftime('%d/%m/%Y')}",
+        description=(
+            f"Giao mới **{len(new_tasks)}** — ✅ hoàn thành **{len(done)}** (đúng hạn {rate}) — "
+            f"⏳ còn tồn **{len(pending)}** — 🔴 quá hạn **{len(overdue)}**"
+        ),
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="✅ Đã xong trong tuần", value=_field_text([_task_short(t, False) for t in done], "Chưa có"), inline=False)
+    embed.add_field(name="🔴 Đang quá hạn", value=_field_text([_task_short(t) for t in overdue], "Không có 🎉"), inline=False)
+    embed.add_field(name="👥 Theo từng người", value=_field_text(person_lines), inline=False)
+    if task_sheet_url():
+        embed.add_field(name="📊 Bảng task", value=task_sheet_url(), inline=False)
+    return embed
+
+
+async def send_report(kind: str) -> int:
+    """Gửi báo cáo ('daily' | 'weekly') vào kênh task của mỗi server. Trả về số kênh đã gửi."""
+    sent = 0
+    for guild in bot.guilds:
+        channel = find_task_channel(guild)
+        if not channel:
+            continue
+        embed = build_daily_report(guild.id) if kind == "daily" else build_weekly_report(guild.id)
+        await channel.send(embed=embed)
+        sent += 1
+    return sent
+
+
+async def maybe_send_scheduled_reports() -> None:
+    now = now_vn()
+    today = now.strftime("%Y-%m-%d")
+    daily = _parse_hhmm(DAILY_REPORT_TIME)
+    # Thứ 2 -> Thứ 7; chỉ gửi bù trong buổi sáng (tránh bot restart buổi tối lại bắn báo cáo sáng)
+    if (
+        daily and now.weekday() <= 5 and get_setting("last_daily_report") != today
+        and (now.hour, now.minute) >= daily and now.hour < 12
+    ):
+        set_setting("last_daily_report", today)
+        await send_report("daily")
+    weekly = _parse_hhmm(WEEKLY_REPORT_TIME)
+    if (
+        weekly and now.weekday() == WEEKLY_REPORT_WEEKDAY and get_setting("last_weekly_report") != today
+        and (now.hour, now.minute) >= weekly and now.hour < 22
+    ):
+        set_setting("last_weekly_report", today)
+        await send_report("weekly")
+
+
+async def scheduler_loop() -> None:
+    """Mỗi 30 giây: lời nhắc đến hạn, task từ Sheet, cảnh báo sắp hết hạn/quá hạn, báo cáo định kỳ."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            now_ts = int(now_vn().timestamp())
+
+            reminders = REMINDER_TABLE.load()
+            due = [r for r in reminders if int(r.get("due_ts", 0)) <= now_ts]
+            if due:
+                REMINDER_TABLE.save([r for r in reminders if int(r.get("due_ts", 0)) > now_ts])
+            for r in due:
+                guild = get_task_guild(None)
+                channel = (
+                    await _get_messageable(int(r["channel_id"])) if r.get("channel_id")
+                    else (find_task_channel(guild) if guild else None)
+                )
+                if not channel:
+                    continue
+                who = f"<@{r['user_id']}>" if r.get("user_id") else (r.get("user_name") or "anh em")
+                if not r.get("user_id") and r.get("user_name") and guild:
+                    member = find_member_by_name(guild, r["user_name"])
+                    who = member.mention if member else who
+                await channel.send(f"🔔 **TỚI GIỜ RỒI {who} ƠI!**\n👉 Lời nhắc: **{r['text']}**")
+
+            await announce_sheet_tasks()
+
+            tasks = _load_tasks()
+            changed = False
+            for t in tasks.values():
+                if t.get("status") != "pending" or not t.get("channel_id") or not t.get("deadline_ts"):
+                    continue
+                deadline_ts = int(t.get("deadline_ts", 0))
+                mentions = " ".join(f"<@{uid}>" for uid in t.get("assigned_user_ids", []))
+                channel = None
+                if not t.get("warned_soon") and 0 < deadline_ts - now_ts <= 3600:
+                    channel = await _get_messageable(int(t["channel_id"]))
+                    if channel:
+                        await channel.send(
+                            f"⏳ {mentions} còn chưa tới **1 tiếng** (<t:{deadline_ts}:R>) là hết hạn task "
+                            f"**{t.get('task_desc')}**. Nhớ nộp file/link sản phẩm nhé!"
+                        )
+                    t["warned_soon"] = True
+                    changed = True
+                if not t.get("warned_overdue") and deadline_ts <= now_ts:
+                    channel = channel or await _get_messageable(int(t["channel_id"]))
+                    if channel:
+                        creator = f"<@{t['creator_id']}>" if t.get("creator_id") else "Sếp"
+                        await channel.send(
+                            f"⏰ **HẾT GIỜ RỒI {mentions} ƠI!**\n👉 Task **{t.get('task_desc')}** đã quá hạn "
+                            f"(<t:{deadline_ts}:R>). Mau nộp file báo cáo cho {creator} nhé! 😼🔥"
+                        )
+                    t["warned_overdue"] = True
+                    changed = True
+            if changed:
+                _save_tasks(tasks)
+
+            await maybe_send_scheduled_reports()
+        except Exception as exc:
+            logger.warning("Lỗi vòng lặp nhắc việc: %s", exc)
+        await asyncio.sleep(30)
 
 
 def clean_bot_mention(message: discord.Message) -> str:
@@ -1407,16 +2446,71 @@ async def execute_natural_action(
     if action_type == "remind":
         minutes = max(1, min(int(action_data.get("minutes", 5)), 1440))
         task_text = str(action_data.get("task", "Đến giờ hẹn rồi!")).strip()
+        due_ts = int(now_vn().timestamp()) + minutes * 60
+        remind_user_id = target_member.id if target_member else message.author.id
+        add_reminder(message.channel.id, remind_user_id, task_text, due_ts)
+        return f"⏰ **[Hệ thống]:** Đã hẹn <t:{due_ts}:t> (<t:{due_ts}:R>) sẽ tag <@{remind_user_id}> nhắc `{task_text}`!"
 
-        async def _natural_timer() -> None:
-            await asyncio.sleep(minutes * 60)
-            await message.channel.send(
-                f"🔔 **TỚI GIỜ RỒI {message.author.mention} ƠI!**\n"
-                f"👉 Lời nhắc sau {minutes} phút: **{task_text}**! Triển ngay thôi! 🚬😼"
-            )
+    if action_type == "remember":
+        fact = str(action_data.get("fact", "")).strip()
+        if not fact:
+            return "⚠️ *(Sếp muốn em nhớ điều gì ạ?)*"
+        mem_id = add_team_memory(fact, message.author.display_name, message.guild.id if message.guild else None)
+        return f"🧠 **[Đã ghi nhớ #{mem_id}]:** {fact}"
 
-        asyncio.create_task(_natural_timer())
-        return f"⏰ **[Hệ thống]:** Đã đặt hẹn giờ **{minutes} phút** nữa sẽ tag nhắc `{task_text}`!"
+    if action_type == "forget":
+        query = str(action_data.get("query", "")).strip()
+        removed = remove_team_memory(query, message.guild.id if message.guild else None)
+        if not removed:
+            return f"⚠️ *(Không tìm thấy ghi nhớ nào khớp `{query}`)*"
+        return "🗑️ **[Đã quên]:** " + " | ".join(removed[:5])
+
+    if action_type == "memory_list":
+        memories = get_team_memories(message.guild.id if message.guild else None)
+        if not memories:
+            return "🧠 **[Trí nhớ team]:** Chưa ghi nhớ điều gì."
+        lines = [f"`#{m.get('id')}` {m.get('text')}" for m in memories[-25:]]
+        return "🧠 **[Trí nhớ team]:**\n" + "\n".join(lines)
+
+    if action_type == "task_list":
+        guild_id = message.guild.id if message.guild else None
+        only_user = target_member.id if target_member else None
+        phase_filter = str(action_data.get("phase", "")).strip()
+        pending = get_pending_tasks(guild_id, only_user, phase_filter or None)
+        sheet_note = f"\n📊 Bảng task: <{task_sheet_url()}>" if task_sheet_url() else ""
+        if not pending:
+            return "📋 **[Task]:** Không có task nào đang chờ nộp. 🎉" + sheet_note
+        phase_label = f" — giai đoạn {phase_filter}" if phase_filter else ""
+        header = f"📋 **[Task đang chạy{phase_label} — {len(pending)} task]:**"
+        return header + "\n" + "\n".join(format_task_line(t) for t in pending[:20]) + sheet_note
+
+    if action_type == "set_phase":
+        if not caller_is_boss:
+            return "⚠️ *(Chỉ Sếp Phát mới được đổi giai đoạn dự án!)*"
+        phase = str(action_data.get("phase", "")).strip()
+        set_setting("current_phase", phase)
+        if not phase:
+            return "🏷️ **[Hệ thống]:** Đã bỏ giai đoạn hiện tại."
+        return f"🏷️ **[Hệ thống]:** Chuyển sang giai đoạn **{phase}** — task giao từ giờ sẽ gắn nhãn giai đoạn này."
+
+    if action_type == "report":
+        kind = "weekly" if str(action_data.get("kind", "")).lower().startswith("w") else "daily"
+        guild_id = message.guild.id if message.guild else None
+        embed = build_weekly_report(guild_id) if kind == "weekly" else build_daily_report(guild_id)
+        await message.reply(embed=embed, mention_author=False)
+        return "__ALREADY_RESPONDED__"
+
+    if action_type in ("task_close", "task_cancel"):
+        if not caller_is_boss:
+            return "⚠️ *(Chỉ Sếp Phát mới được đóng/huỷ task thủ công!)*"
+        query = str(action_data.get("query", "")).strip()
+        task = find_pending_task(query, message.guild.id if message.guild else None)
+        if not task:
+            return f"⚠️ *(Không tìm thấy task đang chạy khớp `{query}`)*"
+        new_status = "cancelled" if action_type == "task_cancel" else "completed"
+        set_task_status(task["task_id"], new_status)
+        verb = "Huỷ" if new_status == "cancelled" else "Đóng (Done)"
+        return f"✅ **[Hệ thống]:** Đã {verb} task **{task.get('task_desc')}**."
 
     if action_type == "poll":
         question = str(action_data.get("question", "Bình chọn anh em ơi!")).strip()
@@ -1495,7 +2589,7 @@ async def execute_natural_action(
 
         # Phân biệt nhắc nhở (reminder) hay giao việc mới (new task)
         is_reminder = any(w in message.clean_content.lower() for w in ("nhắc", "đòi", "tiến độ", "hỏi task"))
-        task_title = "🔔 NHẮC NHỞ CÔNG VIỆC / TASK!" if is_reminder else "📋 TASK MỚI ĐƯỢC GIAO!"
+        phase = str(action_data.get("phase", "")).strip() or get_setting("current_phase")
         mention_str = " ".join(m.mention for m in targets)
         announcement_lead = (
             f"📣 Ê {mention_str} — Sếp Phát nhắc kiểm tra task nè, đọc kỹ rồi triển gấp nhé! 🔥"
@@ -1503,19 +2597,14 @@ async def execute_natural_action(
             else f"📣 Ê {mention_str} — có task mới nè, đọc kỹ rồi triển nhanh! 🔥"
         )
 
-        task_embed = discord.Embed(
-            title=task_title,
-            description=(
-                f"📝 **Nội dung:** {task_desc}\n\n"
-                f"⏳ **Hạn chót & Đếm ngược:** <t:{deadline_ts}:F> (<t:{deadline_ts}:R>)\n\n"
-                f"👤 **Người giao/nhắc:** {message.author.mention}\n"
-                f"🎯 **Người nhận:** {mention_str}\n\n"
-                f"📁 **Quy tắc duyệt Done:** Đính kèm FILE làm việc (tài liệu/code/báo cáo hoặc link sản phẩm) vào kênh này thì Boss mới tự động tick Done!"
-            ),
-            color=discord.Color.gold() if is_reminder else discord.Color.orange(),
-        )
-        task_embed.set_footer(
-            text=f"Bởi {message.author.display_name} • ⚠️ BẮT BUỘC nộp kèm FILE làm việc để hoàn thành! 📁"
+        task_embed = build_task_embed(
+            task_desc,
+            deadline_ts,
+            message.author.mention,
+            mention_str,
+            phase=phase,
+            is_reminder=is_reminder,
+            footer_name=message.author.display_name,
         )
         task_msg = await message.reply(
             content=announcement_lead,
@@ -1539,26 +2628,10 @@ async def execute_natural_action(
             assigned_names=assigned_names,
             task_desc=task_desc,
             deadline_ts=deadline_ts,
+            phase=phase,
         )
 
-        # Tự động hẹn giờ bắn ping réo khi hết thời gian đếm ngược (nếu <= 7 ngày)
-        diff_seconds = max(0, deadline_ts - int(datetime.datetime.now().timestamp()))
-        if 0 < diff_seconds <= 86400 * 7:
-            async def _task_deadline_reminder() -> None:
-                await asyncio.sleep(diff_seconds)
-                # Chỉ ping réo nếu task vẫn đang pending
-                current_t = get_task_by_id(task_msg.id)
-                if current_t and current_t.get("status") != "pending":
-                    return
-                try:
-                    await message.channel.send(
-                        f"⏰ **HẾT GIỜ RỒI {mention_str} ƠI!**\n"
-                        f"👉 Task: **{task_desc}** đã hết hạn đếm ngược (<t:{deadline_ts}:R>)! Mau nộp file báo cáo cho {message.author.mention} kẻo bị Sếp sấy nhé! 😼🔥"
-                    )
-                except Exception as rem_exc:
-                    logger.warning("Lỗi gửi ping hết hạn task: %s", rem_exc)
-
-            asyncio.create_task(_task_deadline_reminder())
+        # Việc nhắc sắp hết hạn / quá hạn do scheduler_loop đảm nhiệm (không mất khi bot restart)
 
         return "__ALREADY_RESPONDED__"
 
@@ -1653,7 +2726,7 @@ async def on_message(message: discord.Message) -> None:
                         pending_task["message_id"]
                     )
                     if orig_msg and orig_msg.embeds:
-                        now_ts = int(datetime.datetime.now().timestamp())
+                        now_ts = int(now_vn().timestamp())
                         done_embed = discord.Embed(
                             title="✅ TASK ĐÃ HOÀN THÀNH XUẤT SẮC!",
                             description=(
@@ -1888,10 +2961,15 @@ async def on_message(message: discord.Message) -> None:
                 channel_id, config.system_prompt
             )
             channel_it_mode = get_channel_it_context(message.channel)
+            guild_id = message.guild.id if message.guild else None
+            system_prompt = f"{base_system_prompt}{channel_it_mode}{build_time_context()}"
             if authorized:
-                system_prompt = f"{base_system_prompt}{channel_it_mode}\n\n{NATURAL_ACTION_INSTRUCTION}"
-            else:
-                system_prompt = f"{base_system_prompt}{channel_it_mode}"
+                system_prompt += (
+                    f"\n\n{ASSISTANT_GUIDELINES}"
+                    f"{build_memory_context(guild_id)}"
+                    f"{build_task_context(guild_id)}"
+                    f"\n\n{NATURAL_ACTION_INSTRUCTION}"
+                )
 
             messages_payload: List[dict] = [
                 {"role": "system", "content": system_prompt}
@@ -1931,11 +3009,13 @@ async def on_message(message: discord.Message) -> None:
                 )
 
             try:
-                response = await client.chat.completions.create(
-                    model=selected_model,
-                    messages=messages_payload,
+                response = await create_chat_completion(
+                    client,
+                    selected_model,
+                    messages_payload,
                     temperature=0.6,
-                    max_tokens=4096,
+                    max_tokens=6144,
+                    allow_fallback=not image_data_urls,
                 )
             except Exception as vision_exc:
                 if image_data_urls:
@@ -1951,11 +3031,12 @@ async def on_message(message: discord.Message) -> None:
                         "role": "user",
                         "content": fallback_prompt,
                     }
-                    response = await client.chat.completions.create(
-                        model=text_model,
-                        messages=messages_payload,
+                    response = await create_chat_completion(
+                        client,
+                        text_model,
+                        messages_payload,
                         temperature=0.6,
-                        max_tokens=4096,
+                        max_tokens=6144,
                     )
                 else:
                     raise
@@ -2049,8 +3130,7 @@ async def on_message(message: discord.Message) -> None:
                 )
                 return
 
-            if action_status_note and action_status_note.startswith("⚠️"):
-                # Chỉ hiện khi có lỗi hệ thống
+            if action_status_note:
                 ai_reply = f"{ai_reply}\n\n{action_status_note}".strip()
 
             # Chốt hạ: Luôn lọc sạch mọi vết tích ACTION một lần nữa trước khi gửi
@@ -2260,7 +3340,12 @@ async def tomtat_command(
     prompt = (
         f"[{caller_label}] yêu cầu mày 'Check var' và tóm tắt lại {len(lines)} tin nhắn gần nhất trong kênh chat này.\n"
         f"Nội dung đoạn chat:\n{chat_log}\n\n"
-        "Hãy báo cáo lại rõ ràng: Anh em trong phòng vừa bàn tán chuyện gì? Có ai nói xấu Sếp Phát hay có drama gì hài hước không? Bình luận thêm vài câu mặn mòi chuẩn chất Boss!"
+        "Báo cáo theo cấu trúc:\n"
+        "**📌 Chủ đề chính** (mỗi chủ đề 1 dòng)\n"
+        "**✅ Đã chốt** (quyết định/thống nhất)\n"
+        "**📝 Việc cần làm** (ai — việc gì — hạn, nếu có)\n"
+        "**❓ Còn bỏ ngỏ** (câu hỏi chưa ai trả lời, vấn đề chưa xử lý)\n"
+        "Mục nào không có thì bỏ qua. Cuối cùng thêm 1 câu bình luận ngắn chất Boss nếu có drama vui."
     )
     reply = await ask_ai_Boss(prompt)
     for chunk in split_long_message(reply):
@@ -2453,21 +3538,11 @@ async def remind_command(
         )
         return
 
+    due_ts = int(now_vn().timestamp()) + so_phut * 60
+    add_reminder(interaction.channel_id or 0, interaction.user.id, noi_dung, due_ts)
     await interaction.response.send_message(
-        f"⏰ **Đã rõ!** Đúng **{so_phut} phút** nữa em sẽ réo tên {interaction.user.mention} nhắc vụ: **{noi_dung}**! 🫡"
+        f"⏰ **Đã rõ!** <t:{due_ts}:t> (<t:{due_ts}:R>) em sẽ réo tên {interaction.user.mention} nhắc vụ: **{noi_dung}**! 🫡"
     )
-
-    async def _timer_task() -> None:
-        await asyncio.sleep(so_phut * 60)
-        if interaction.channel and isinstance(
-            interaction.channel, (discord.TextChannel, discord.Thread, discord.DMChannel)
-        ):
-            await interaction.channel.send(
-                f"🔔 **TỚI GIỜ RỒI {interaction.user.mention} ƠI!**\n"
-                f"👉 Nhắc lịch sau {so_phut} phút: **{noi_dung}**! Triển ngay kẻo lỡ việc! 🚬😼"
-            )
-
-    asyncio.create_task(_timer_task())
 
 
 @bot.tree.command(
@@ -2831,6 +3906,144 @@ async def persona_command(
 
 
 @bot.tree.command(
+    name="kenh", description="🗂️ [Chỉ Sếp Phát] Gán vai trò của Boss cho kênh hiện tại"
+)
+@app_commands.describe(che_do="Vai trò của Boss trong kênh này (bỏ trống để xem / chọn 'Tự động' để theo tên kênh)")
+@app_commands.choices(
+    che_do=[app_commands.Choice(name="🔄 Tự động theo tên kênh", value="auto")]
+    + [app_commands.Choice(name=m["label"], value=key) for key, m in CHANNEL_MODES.items()]
+)
+async def kenh_command(
+    interaction: discord.Interaction, che_do: Optional[app_commands.Choice[str]] = None
+) -> None:
+    channel = interaction.channel
+    channel_id = interaction.channel_id or 0
+    if che_do is not None:
+        if not is_user_boss(interaction.user, interaction.guild):
+            await reject_unauthorized(interaction)
+            return
+        if che_do.value == "auto":
+            config.channel_modes.pop(channel_id, None)
+        else:
+            config.channel_modes[channel_id] = che_do.value
+        config.save_state()
+    mode = resolve_channel_mode(channel) if channel else None
+    label = CHANNEL_MODES[mode]["label"] if mode in CHANNEL_MODES else "🌐 Đa năng (mặc định)"
+    source = "gán thủ công" if channel_id in config.channel_modes else "tự động theo tên kênh"
+    await interaction.response.send_message(f"🗂️ Vai trò của Boss ở kênh này: **{label}** *({source})*")
+
+
+@bot.tree.command(
+    name="tasks", description="📋 Xem các task đang chạy (của cả team hoặc của một người)"
+)
+@app_commands.describe(
+    thanh_vien="(Tuỳ chọn) Chỉ xem task của người này",
+    giai_doan="(Tuỳ chọn) Chỉ xem task của giai đoạn này",
+)
+async def tasks_command(
+    interaction: discord.Interaction,
+    thanh_vien: Optional[discord.Member] = None,
+    giai_doan: Optional[str] = None,
+) -> None:
+    guild_id = interaction.guild.id if interaction.guild else None
+    pending = get_pending_tasks(guild_id, thanh_vien.id if thanh_vien else None, giai_doan)
+    if not pending:
+        sheet_note = f"\n📊 Bảng task: <{task_sheet_url()}>" if task_sheet_url() else ""
+        await interaction.response.send_message(f"📋 Không có task nào đang chờ nộp. 🎉{sheet_note}")
+        return
+    owner = f" của {thanh_vien.display_name}" if thanh_vien else ""
+    if giai_doan:
+        owner += f" — giai đoạn {giai_doan}"
+    text = f"📋 **Task đang chạy{owner} — {len(pending)} task:**\n" + "\n".join(
+        format_task_line(t) for t in pending[:25]
+    )
+    if task_sheet_url():
+        text += f"\n📊 Bảng task đầy đủ: <{task_sheet_url()}>"
+    chunks = split_long_message(text)
+    await interaction.response.send_message(chunks[0])
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk)
+
+
+@bot.tree.command(
+    name="giaidoan", description="🏷️ Xem / đổi giai đoạn dự án hiện tại (task mới sẽ gắn nhãn giai đoạn này)"
+)
+@app_commands.describe(ten="(Chỉ Sếp Phát) Tên giai đoạn mới, ví dụ: GĐ1 - Ra mắt sản phẩm. Gõ 'xoa' để bỏ")
+async def giaidoan_command(interaction: discord.Interaction, ten: Optional[str] = None) -> None:
+    if ten is not None and ten.strip():
+        if not is_user_boss(interaction.user, interaction.guild):
+            await reject_unauthorized(interaction)
+            return
+        new_phase = "" if _norm_name(ten) in ("xoa", "bo", "none") else ten.strip()
+        set_setting("current_phase", new_phase)
+    phase = get_setting("current_phase")
+    if not phase:
+        await interaction.response.send_message("🏷️ Chưa đặt giai đoạn. Sếp dùng `/giaidoan ten:...` để đặt.")
+        return
+    count = len(get_pending_tasks(interaction.guild.id if interaction.guild else None, phase=phase))
+    await interaction.response.send_message(
+        f"🏷️ Giai đoạn hiện tại: **{phase}** — đang chạy **{count}** task của giai đoạn này."
+    )
+
+
+@bot.tree.command(name="baocao", description="📈 Báo cáo tình hình task ngay bây giờ")
+@app_commands.choices(
+    loai=[
+        app_commands.Choice(name="☀️ Báo cáo ngày (quá hạn, hạn hôm nay, khối lượng việc)", value="daily"),
+        app_commands.Choice(name="📈 Tổng kết tuần (đã xong, tỉ lệ đúng hạn, theo từng người)", value="weekly"),
+    ]
+)
+async def baocao_command(
+    interaction: discord.Interaction, loai: Optional[app_commands.Choice[str]] = None
+) -> None:
+    if not is_user_authorized(interaction.user, interaction.guild):
+        await reject_unauthorized(interaction)
+        return
+    guild_id = interaction.guild.id if interaction.guild else None
+    kind = loai.value if loai else "daily"
+    embed = build_weekly_report(guild_id) if kind == "weekly" else build_daily_report(guild_id)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(
+    name="memory", description="🧠 Xem / thêm / xoá trí nhớ dài hạn của Boss về team"
+)
+@app_commands.describe(
+    ghi_nho="(Tuỳ chọn) Điều muốn Boss ghi nhớ lâu dài",
+    xoa="(Tuỳ chọn) Mã # hoặc từ khoá của ghi nhớ cần xoá",
+)
+async def memory_command(
+    interaction: discord.Interaction,
+    ghi_nho: Optional[str] = None,
+    xoa: Optional[str] = None,
+) -> None:
+    if not is_user_authorized(interaction.user, interaction.guild):
+        await reject_unauthorized(interaction)
+        return
+    guild_id = interaction.guild.id if interaction.guild else None
+    if ghi_nho and ghi_nho.strip():
+        mem_id = add_team_memory(ghi_nho, interaction.user.display_name, guild_id)
+        await interaction.response.send_message(f"🧠 Đã ghi nhớ `#{mem_id}`: {ghi_nho.strip()}")
+        return
+    if xoa and xoa.strip():
+        removed = remove_team_memory(xoa, guild_id)
+        msg = ("🗑️ Đã quên: " + " | ".join(removed[:5])) if removed else f"⚠️ Không tìm thấy ghi nhớ khớp `{xoa}`"
+        await interaction.response.send_message(msg)
+        return
+    memories = get_team_memories(guild_id)
+    if not memories:
+        await interaction.response.send_message("🧠 Chưa ghi nhớ điều gì. Dùng `/memory ghi_nho:...` hoặc nói *\"Boss nhớ giùm tao...\"*")
+        return
+    text = "🧠 **Trí nhớ dài hạn của team:**\n" + "\n".join(
+        f"`#{m.get('id')}` {m.get('text')} *(— {m.get('by')})*" for m in memories[-40:]
+    )
+    chunks = split_long_message(text)
+    await interaction.response.send_message(chunks[0])
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk)
+
+
+@bot.tree.command(
     name="status", description="🤖 Xem trạng thái quyền lực của Boss và cấp bậc của bạn"
 )
 async def status_command(interaction: discord.Interaction) -> None:
@@ -2861,8 +4074,8 @@ async def status_command(interaction: discord.Interaction) -> None:
     embed.add_field(
         name="Danh sách Tuyệt Kỹ (Slash Commands)",
         value=(
-            "• **Quyền lực Sếp Phát:** `/vip`, `/timeout`, `/clear_msg`, `/nickname`, `/persona`, `/provider`\n"
-            "• **Bắt Trend & Trợ lý (Sếp & VIP):** `/trend`, `/search`, `/tomtat`, `/remind`, `/poll`\n"
+            "• **Quyền lực Sếp Phát:** `/vip`, `/timeout`, `/clear_msg`, `/nickname`, `/persona`, `/provider`, `/kenh`\n"
+            "• **Bắt Trend & Trợ lý (Sếp & VIP):** `/trend`, `/search`, `/tomtat`, `/remind`, `/poll`, `/tasks`, `/memory`, `/baocao`, `/giaidoan`\n"
             "• **Giải trí & Tấu hài:** `/roast` (có phản đam), `/khen`, `/boi`, `/chon`, `/status`"
         ),
         inline=False,
