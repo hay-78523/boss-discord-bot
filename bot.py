@@ -87,7 +87,8 @@ Khi Sếp Phát (hoặc VIP) yêu cầu thực hiện hành động trên Discor
 - Gỡ ban: `<ACTION>{"type": "unban", "target": "Tên hoặc ID"}</ACTION>`
 - Xoá tin nhắn: `<ACTION>{"type": "clear_msg", "count": 10}</ACTION>`
 - Đổi biệt danh: `<ACTION>{"type": "nickname", "nick": "Tên Mới"}</ACTION>`
-- Hẹn giờ nhắc việc (đổi giờ/ngày ra số phút tính từ BÂY GIỜ, tối đa 1440): `<ACTION>{"type": "remind", "minutes": 10, "task": "Nội dung"}</ACTION>`
+- Giao việc HOẶC nhắc việc cho người khác LUÔN dùng assign_task (hệ thống tự nhắc trước hạn/quá hạn, và nếu người đó đang có task trùng thì tự nhắc lại task cũ chứ không tạo mới).
+- Hẹn giờ nhắc riêng cho chính người đang nói (đổi giờ/ngày ra số phút tính từ BÂY GIỜ, tối đa 1440): `<ACTION>{"type": "remind", "minutes": 10, "task": "Nội dung"}</ACTION>`
 - Ghi nhớ lâu dài (khi được dặn "nhớ giùm", "ghi nhớ", "từ giờ...", hoặc thông tin quan trọng như quy định, deadline dự án, thông tin khách hàng): `<ACTION>{"type": "remember", "fact": "Câu ngắn gọn, đủ ngữ cảnh"}</ACTION>`
 - Quên một ghi nhớ: `<ACTION>{"type": "forget", "query": "mã # hoặc từ khoá"}</ACTION>`
 - Xem những gì đã ghi nhớ: `<ACTION>{"type": "memory_list"}</ACTION>`
@@ -1313,6 +1314,7 @@ TASK_SHEET_HEADERS = [
     "Mã task", "Giai đoạn", "Nội dung", "Người nhận", "Hạn chót", "Trạng thái", "Người giao",
     "Ngày giao", "File/Link đã nộp", "Ngày nộp",
     "ID người nhận", "ID người giao", "ID kênh", "ID server", "Đã nhắc sắp hạn", "Đã báo quá hạn",
+    "Đã nhắc trước 1 ngày", "Lần réo quá hạn gần nhất",
 ]
 TASK_STATUS_TO_VN = {"pending": "Đang làm", "completed": "Hoàn thành", "cancelled": "Huỷ"}
 TASK_STATUS_FROM_VN = {
@@ -1342,12 +1344,15 @@ def _task_to_row(t: Dict[str, Any]) -> List[str]:
         str(t.get("guild_id") or ""),
         "x" if t.get("warned_soon") else "",
         "x" if t.get("warned_overdue") else "",
+        "x" if t.get("warned_day") else "",
+        str(t.get("last_nag") or ""),
     ]
 
 
 def _row_to_task(row: List[str], row_index: int) -> Optional[Dict[str, Any]]:
     (task_id, phase, desc, names, deadline, status, creator_name, created, submitted_file,
-     submitted_at, assigned_ids, creator_id, channel_id, guild_id, warned_soon, warned_overdue) = row
+     submitted_at, assigned_ids, creator_id, channel_id, guild_id, warned_soon, warned_overdue,
+     warned_day, last_nag) = row
     if not desc:
         return None
     now_ts = int(now_vn().timestamp())
@@ -1372,6 +1377,8 @@ def _row_to_task(row: List[str], row_index: int) -> Optional[Dict[str, Any]]:
         "submitted_by_id": None,
         "warned_soon": bool(warned_soon),
         "warned_overdue": bool(warned_overdue),
+        "warned_day": bool(warned_day),
+        "last_nag": last_nag,
     }
 
 
@@ -1883,7 +1890,6 @@ def build_task_embed(
     creator_text: str,
     mention_str: str,
     phase: str = "",
-    is_reminder: bool = False,
     footer_name: str = "",
 ) -> discord.Embed:
     deadline_line = (
@@ -1891,16 +1897,17 @@ def build_task_embed(
     )
     phase_line = f"🏷️ **Giai đoạn:** {phase}\n" if phase else ""
     embed = discord.Embed(
-        title="🔔 NHẮC NHỞ CÔNG VIỆC / TASK!" if is_reminder else "📋 TASK MỚI ĐƯỢC GIAO!",
+        title="📋 TASK MỚI ĐƯỢC GIAO!",
         description=(
             f"📝 **Nội dung:** {task_desc}\n\n"
             f"{phase_line}"
             f"⏳ **Hạn chót & Đếm ngược:** {deadline_line}\n\n"
             f"👤 **Người giao/nhắc:** {creator_text}\n"
             f"🎯 **Người nhận:** {mention_str}\n\n"
+            f"🔔 **Tự động nhắc:** trước hạn 1 ngày, trước hạn 1 tiếng, lúc hết hạn và mỗi sáng nếu trễ hạn.\n"
             f"📁 **Quy tắc duyệt Done:** Đính kèm FILE làm việc (tài liệu/code/báo cáo hoặc link sản phẩm) vào kênh này thì Boss mới tự động tick Done!"
         ),
-        color=discord.Color.gold() if is_reminder else discord.Color.orange(),
+        color=discord.Color.orange(),
     )
     embed.set_footer(
         text=f"Bởi {footer_name or 'Boss'} • ⚠️ BẮT BUỘC nộp kèm FILE làm việc để hoàn thành! 📁"
@@ -2115,6 +2122,60 @@ async def maybe_send_scheduled_reports() -> None:
         await send_report("weekly")
 
 
+OVERDUE_NAG_HOUR = 9  # Quá hạn mà chưa nộp -> mỗi sáng 9h réo lại (tag cả người giao)
+
+
+async def send_task_auto_reminders(t: Dict[str, Any], now_ts: int) -> bool:
+    """Bot tự nhắc thay Sếp: trước hạn 1 ngày, trước hạn 1 tiếng, lúc hết hạn, rồi mỗi sáng sau đó tới khi nộp."""
+    deadline_ts = int(t.get("deadline_ts", 0))
+    mentions = " ".join(f"<@{uid}>" for uid in t.get("assigned_user_ids", [])) or ", ".join(t.get("assigned_names", []))
+    creator = f"<@{t['creator_id']}>" if t.get("creator_id") else "Sếp"
+    desc = t.get("task_desc")
+    remaining = deadline_ts - now_ts
+    duration = deadline_ts - int(t.get("created_at") or now_ts)
+    today = now_vn().strftime("%Y-%m-%d")
+
+    text: Optional[str] = None
+    if not t.get("warned_day") and 3600 < remaining <= 86400 and duration > 30 * 3600:
+        t["warned_day"] = True
+        text = (
+            f"📌 {mentions} nhắc nhẹ: task **{desc}** còn **1 ngày** nữa là hết hạn (<t:{deadline_ts}:F>). "
+            f"Đang vướng gì thì báo {creator} sớm nhé!"
+        )
+    elif not t.get("warned_soon") and 0 < remaining <= 3600:
+        t["warned_soon"] = True
+        t["warned_day"] = True
+        text = (
+            f"⏳ {mentions} còn chưa tới **1 tiếng** (<t:{deadline_ts}:R>) là hết hạn task **{desc}**. "
+            f"Nhớ nộp file/link sản phẩm vào kênh này nhé!"
+        )
+    elif not t.get("warned_overdue") and remaining <= 0:
+        t["warned_overdue"] = True
+        t["warned_soon"] = t["warned_day"] = True
+        t["last_nag"] = today
+        text = (
+            f"⏰ **HẾT GIỜ RỒI {mentions} ƠI!**\n👉 Task **{desc}** đã quá hạn (<t:{deadline_ts}:R>). "
+            f"Mau nộp file báo cáo cho {creator} nhé! 😼🔥"
+        )
+    elif (
+        t.get("warned_overdue") and remaining < 0 and t.get("last_nag") != today
+        and now_vn().hour >= OVERDUE_NAG_HOUR
+    ):
+        t["last_nag"] = today
+        days_late = max(1, -remaining // 86400)
+        text = (
+            f"🔴 {mentions} task **{desc}** đã trễ hạn **{days_late} ngày** mà chưa nộp. "
+            f"{creator} ơi, em vẫn đang réo giùm Sếp đây ạ! 📁"
+        )
+
+    if text is None:
+        return False
+    channel = await _get_messageable(int(t["channel_id"]))
+    if channel:
+        await channel.send(text)
+    return True
+
+
 async def scheduler_loop() -> None:
     """Mỗi 30 giây: lời nhắc đến hạn, task từ Sheet, cảnh báo sắp hết hạn/quá hạn, báo cáo định kỳ."""
     await bot.wait_until_ready()
@@ -2147,27 +2208,7 @@ async def scheduler_loop() -> None:
             for t in tasks.values():
                 if t.get("status") != "pending" or not t.get("channel_id") or not t.get("deadline_ts"):
                     continue
-                deadline_ts = int(t.get("deadline_ts", 0))
-                mentions = " ".join(f"<@{uid}>" for uid in t.get("assigned_user_ids", []))
-                channel = None
-                if not t.get("warned_soon") and 0 < deadline_ts - now_ts <= 3600:
-                    channel = await _get_messageable(int(t["channel_id"]))
-                    if channel:
-                        await channel.send(
-                            f"⏳ {mentions} còn chưa tới **1 tiếng** (<t:{deadline_ts}:R>) là hết hạn task "
-                            f"**{t.get('task_desc')}**. Nhớ nộp file/link sản phẩm nhé!"
-                        )
-                    t["warned_soon"] = True
-                    changed = True
-                if not t.get("warned_overdue") and deadline_ts <= now_ts:
-                    channel = channel or await _get_messageable(int(t["channel_id"]))
-                    if channel:
-                        creator = f"<@{t['creator_id']}>" if t.get("creator_id") else "Sếp"
-                        await channel.send(
-                            f"⏰ **HẾT GIỜ RỒI {mentions} ƠI!**\n👉 Task **{t.get('task_desc')}** đã quá hạn "
-                            f"(<t:{deadline_ts}:R>). Mau nộp file báo cáo cho {creator} nhé! 😼🔥"
-                        )
-                    t["warned_overdue"] = True
+                if await send_task_auto_reminders(t, now_ts):
                     changed = True
             if changed:
                 _save_tasks(tasks)
@@ -2225,6 +2266,15 @@ def resolve_target_member(
             return member
 
     return None
+
+
+def _task_desc_similar(a: str, b: str) -> bool:
+    """So khớp mô tả task (bỏ dấu, theo từ): trùng nhiều từ thì coi là cùng một task."""
+    words_a = {w for w in re.findall(r"\w+", _norm_name(a)) if len(w) > 1}
+    words_b = {w for w in re.findall(r"\w+", _norm_name(b)) if len(w) > 1}
+    if not words_a or not words_b:
+        return False
+    return len(words_a & words_b) / min(len(words_a), len(words_b)) >= 0.5
 
 
 async def execute_natural_action(
@@ -2633,15 +2683,31 @@ async def execute_natural_action(
         time_scan_text = f"{raw_deadline} {task_desc} {message.clean_content}"
         deadline_ts, deadline_label = parse_task_deadline(time_scan_text)
 
-        # Phân biệt nhắc nhở (reminder) hay giao việc mới (new task)
-        is_reminder = any(w in message.clean_content.lower() for w in ("nhắc", "đòi", "tiến độ", "hỏi task"))
         phase = str(action_data.get("phase", "")).strip() or get_setting("current_phase")
         mention_str = " ".join(m.mention for m in targets)
-        announcement_lead = (
-            f"📣 Ê {mention_str} — Sếp Phát nhắc kiểm tra task nè, đọc kỹ rồi triển gấp nhé! 🔥"
-            if is_reminder
-            else f"📣 Ê {mention_str} — có task mới nè, đọc kỹ rồi triển nhanh! 🔥"
+
+        # "Nhắc @A task X" mà A đang có task đó -> nhắc lại task đang chạy, KHÔNG tạo task trùng
+        asks_to_remind = any(
+            w in message.clean_content.lower() for w in ("nhắc", "đòi", "tiến độ", "hỏi task", "hối")
         )
+        if asks_to_remind:
+            target_ids = {m.id for m in targets if isinstance(m, (discord.Member, discord.User))}
+            existing = [
+                t for t in get_pending_tasks(message.guild.id if message.guild else None)
+                if target_ids & set(t.get("assigned_user_ids", []))
+            ]
+            matched = [t for t in existing if _task_desc_similar(t.get("task_desc", ""), task_desc)]
+            to_remind = matched or (existing if not action_data.get("task") else [])
+            if to_remind:
+                lines = "\n".join(format_task_line(t) for t in to_remind[:10])
+                await message.reply(
+                    f"🔔 {mention_str} — {message.author.mention} nhắc tiến độ task nè:\n{lines}\n"
+                    f"Xong thì nộp file/link sản phẩm vào kênh để Boss duyệt Done nhé! 📁",
+                    mention_author=False,
+                )
+                return "__ALREADY_RESPONDED__"
+
+        announcement_lead = f"📣 Ê {mention_str} — có task mới nè, đọc kỹ rồi triển nhanh! Boss sẽ tự nhắc khi gần hạn. 🔥"
 
         task_embed = build_task_embed(
             task_desc,
@@ -2649,7 +2715,6 @@ async def execute_natural_action(
             message.author.mention,
             mention_str,
             phase=phase,
-            is_reminder=is_reminder,
             footer_name=message.author.display_name,
         )
         task_msg = await message.reply(
