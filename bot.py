@@ -87,10 +87,10 @@ Khi Sếp Phát (hoặc VIP) ra lệnh bằng lời nói tự nhiên trong tin n
 Chỉ gắn thẻ `<ACTION>...</ACTION>` khi người dùng thực sự yêu cầu thực hiện hành động đó; nếu chỉ trò chuyện/hỏi đáp/xem bói/khen/chửi/tóm tắt/hóng trend bình thường thì KHÔNG gắn thẻ `<ACTION>`.
 
 QUAN TRỌNG VỀ THẺ ACTION:
-- Thẻ `<ACTION>` là thẻ ẨN nội bộ cho hệ thống backend, TUYỆT ĐỐI KHÔNG được hiển thị cho người dùng thấy.
-- Hệ thống sẽ TỰ ĐỘNG cắt bỏ thẻ `<ACTION>...</ACTION>` khỏi tin nhắn trước khi gửi lên Discord.
-- KHÔNG BAO GIỜ viết thẻ `<ACTION>` trong code block, backtick, hay bất kỳ dạng nào khiến nó trở thành text thông thường.
-- Chỉ gắn RAW (không backtick, không quote) ở cuối câu trả lời.
+- Khi người dùng yêu cầu thực hiện hành động (như giao task, nhắc task/nhắc việc, khóa mõm, cấp VIP, hẹn giờ...), mày BẮT BUỘC PHẢI xuất ĐẦY ĐỦ thẻ `<ACTION>{"type": "...", ...}</ACTION>` ở CUỐI CÙNG câu trả lời.
+- Cú pháp PHẢI CÓ ĐỦ cả thẻ mở `<ACTION>` và thẻ đóng `</ACTION>`. TUYỆT ĐỐI KHÔNG ĐƯỢC THIẾU thẻ mở `<ACTION>` hoặc thẻ đóng `</ACTION>`.
+- KHÔNG BAO GIỜ viết thẻ `<ACTION>` trong code block hoặc dấu backtick (`). Chỉ gắn RAW text ở cuối cùng.
+- Máy chủ sẽ tự động đọc thẻ này để thực thi thao tác trên Discord và tự động lọc sạch trước khi gửi lên kênh chat, mày chỉ cần xuất đúng cú pháp.
 
 QUAN TRỌNG VỀ TÍNH CÁCH:
 - Mày LUÔN LUÔN là Boss — con mèo ngậm thuốc ngầu lòi. KHÔNG BAO GIỜ nói kiểu nhạt nhẽo robot.
@@ -909,6 +909,36 @@ def should_bot_respond(
     return True
 
 
+def _strip_action_tags(text: str) -> str:
+    """Dọn sạch MỌI dấu vết ACTION tag, closing tag, và JSON action rác khỏi text."""
+    if not text:
+        return text
+    # 1. Direct replacement of all known tag variants
+    for tag in (
+        "<ACTION>", "</ACTION>", "<action>", "</action>",
+        "< ACTION>", "< /ACTION>", "<ACTION >", "</ACTION >",
+        "< action>", "< /action>", "<action >", "</action >",
+        "＜ACTION＞", "＜/ACTION＞", "＜action＞", "＜/action＞",
+        "&lt;ACTION&gt;", "&lt;/ACTION&gt;",
+    ):
+        text = text.replace(tag, "")
+
+    # 2. Regex for any remaining brackets with ACTION
+    text = re.sub(r"</?\s*action\s*>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"[＜<]\s*/?\s*action\s*[＞>]", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"&lt;\s*/?\s*action\s*&gt;", "", text, flags=re.IGNORECASE)
+
+    # 3. Strip JSON action objects: {"type": "..."}
+    text = re.sub(r'\{[^{}]*\"type\"\s*:\s*\"[a-z_]+\"[^{}]*\}', "", text, flags=re.DOTALL)
+
+    # 4. Strip stray backticks
+    text = re.sub(r"`{1,3}\s*`{1,3}", "", text)
+
+    # 5. Clean up extra whitespace/newlines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def clean_bot_mention(message: discord.Message) -> str:
     content = message.clean_content
     if bot.user:
@@ -1273,46 +1303,61 @@ async def execute_natural_action(
         config.save_state()
         return "🔥 **[Hệ thống]:** Đã bật lại chế độ **Tự động trò chuyện (Auto-Chat)** tại kênh này!"
     if action_type == "assign_task":
-        # Giao task cho thành viên — Sếp Phát hoặc VIP đều được dùng
+        # Giao task / nhắc task cho thành viên — Sếp Phát hoặc VIP đều được dùng
         task_desc = str(action_data.get("task", "")).strip()
         deadline = str(action_data.get("deadline", "")).strip()
         if not task_desc:
-            return "⚠️ *(Chưa có nội dung task để giao. Sếp mô tả task cần làm nhé!)*"
+            task_desc = "Kiểm tra và hoàn thành các công việc được giao"
 
-        # Hỗ trợ giao cho nhiều người (mentions trong tin nhắn)
-        targets: List[discord.Member] = []
+        # Hỗ trợ giao cho nhiều người (mentions / role_mentions / target_member)
+        targets = []
         if message.mentions:
-            targets = [m for m in message.mentions if not m.bot]
-        elif target_member:
-            targets = [target_member]
+            for m in message.mentions:
+                if bot.user and m.id == bot.user.id:
+                    continue
+                if not m.bot:
+                    targets.append(m)
+        if message.role_mentions:
+            for r in message.role_mentions:
+                targets.append(r)
+        if not targets and target_member:
+            targets.append(target_member)
 
         if not targets:
             return "⚠️ *(Sếp tag (mention @) người nhận task nhé, em không biết giao cho ai!)*"
 
-        # Build thông báo task
+        # Phân biệt nhắc nhở (reminder) hay giao việc mới (new task)
+        is_reminder = any(w in message.clean_content.lower() for w in ("nhắc", "đòi", "tiến độ", "hỏi task"))
+        task_title = "🔔 NHẮC NHỞ CÔNG VIỆC / TASK!" if is_reminder else "📋 TASK MỚI ĐƯỢC GIAO!"
         mention_str = " ".join(m.mention for m in targets)
+        announcement_lead = (
+            f"📣 Ê {mention_str} — Sếp Phát nhắc kiểm tra task nè, đọc kỹ rồi triển gấp nhé! 🔥"
+            if is_reminder
+            else f"📣 Ê {mention_str} — có task mới nè, đọc kỹ rồi triển nhanh! 🔥"
+        )
         deadline_line = f"\n⏰ **Deadline:** {deadline}" if deadline else ""
+
         task_embed = discord.Embed(
-            title="📋 TASK MỚI ĐƯỢC GIAO!",
+            title=task_title,
             description=(
                 f"**Nội dung:** {task_desc}{deadline_line}\n\n"
-                f"👤 **Người giao:** {message.author.mention}\n"
+                f"👤 **Người giao/nhắc:** {message.author.mention}\n"
                 f"🎯 **Người nhận:** {mention_str}"
             ),
-            color=discord.Color.orange(),
+            color=discord.Color.gold() if is_reminder else discord.Color.orange(),
         )
         task_embed.set_footer(
-            text=f"Giao bởi {message.author.display_name} • Hoàn thành task rồi react ✅ nhé!"
+            text=f"Bởi {message.author.display_name} • Hoàn thành task rồi react ✅ nhé!"
         )
         task_msg = await message.channel.send(
-            content=f"📣 Ê {mention_str} — có task mới nè, đọc kỹ rồi triển nhanh! 🔥",
+            content=announcement_lead,
             embed=task_embed,
         )
         await task_msg.add_reaction("✅")
         await task_msg.add_reaction("🔄")
 
-        names = ", ".join(f"**{m.display_name}**" for m in targets)
-        return f"📋 **[Hệ thống]:** Đã giao task và tag {names} thành công!"
+        names = ", ".join(f"**{getattr(m, 'display_name', getattr(m, 'name', str(m)))}**" for m in targets)
+        return f"📋 **[Hệ thống]:** Đã nhắc task và tag {names} thành công!"
 
     return None
 
@@ -1572,50 +1617,51 @@ async def on_message(message: discord.Message) -> None:
             # Tách và thực thi thẻ <ACTION>{...}</ACTION> nếu có
             action_status_note: Optional[str] = None
 
-            # ========== EXTRACT: tìm JSON action từ nhiều dạng AI có thể output ==========
+            # ========== EXTRACT action JSON ==========
             action_json_str: Optional[str] = None
-            # Pattern 1: chuẩn <ACTION>{...}</ACTION>
-            _m = re.search(r"<ACTION>\s*(\{.*?\})\s*</ACTION>", raw_ai_reply, flags=re.DOTALL)
-            if _m:
-                action_json_str = _m.group(1)
-            else:
-                # Pattern 2: thiếu thẻ mở — chỉ có {..."type":...}</ACTION>
-                _m = re.search(r'(\{"type"\s*:\s*"[a-z_]+"[^}]*\})\s*</ACTION>', raw_ai_reply, flags=re.DOTALL | re.IGNORECASE)
+            # Tìm JSON action bằng nhiều pattern
+            for _pat in (
+                r"<ACTION>\s*(\{.*?\})\s*</ACTION>",                          # chuẩn
+                r'(\{"type"\s*:\s*"[a-z_]+"[^}]*\})\s*</ACTION>',            # thiếu mở
+                r'<ACTION>\s*(\{"type"\s*:\s*"[a-z_]+"[^}]*\})',              # thiếu đóng
+                r'(\{"type"\s*:\s*"[a-z_]+"[^}]*\})\s*$',                    # JSON trơ cuối
+            ):
+                _m = re.search(_pat, raw_ai_reply, flags=re.DOTALL | re.IGNORECASE)
                 if _m:
                     action_json_str = _m.group(1)
-                else:
-                    # Pattern 3: thiếu thẻ đóng — <ACTION>{...} ở cuối
-                    _m = re.search(r'<ACTION>\s*(\{"type"\s*:\s*"[a-z_]+"[^}]*\})\s*$', raw_ai_reply, flags=re.DOTALL | re.IGNORECASE)
-                    if _m:
-                        action_json_str = _m.group(1)
-                    else:
-                        # Pattern 4: không có thẻ nào — JSON trơ trọi cuối msg
-                        _m = re.search(r'(\{"type"\s*:\s*"(?:assign_task|vip_add|vip_remove|vip_list|timeout|untimeout|kick|ban|unban|add|clear_msg|nickname|remind|poll|reset_memory|quiet_mode|talk_mode)"[^}]*\})\s*$', raw_ai_reply, flags=re.DOTALL)
-                        if _m:
-                            action_json_str = _m.group(1)
+                    break
 
-            # ========== CLEANUP: dọn sạch MỌI dấu vết ACTION/JSON khỏi tin nhắn ==========
-            ai_reply = raw_ai_reply
-            # Xoá <ACTION>{...}</ACTION> chuẩn
-            ai_reply = re.sub(r"<ACTION>\s*\{.*?\}\s*</ACTION>", "", ai_reply, flags=re.DOTALL)
-            # Xoá {..."type":...}</ACTION> (thiếu thẻ mở)
-            ai_reply = re.sub(r'\{[^}]*"type"\s*:\s*"[a-z_]+"[^}]*\}\s*</ACTION>', "", ai_reply, flags=re.DOTALL | re.IGNORECASE)
-            # Xoá <ACTION>{...} (thiếu thẻ đóng)
-            ai_reply = re.sub(r'<ACTION>\s*\{[^}]*"type"\s*:\s*"[a-z_]+"[^}]*\}', "", ai_reply, flags=re.DOTALL | re.IGNORECASE)
-            # Xoá trong backtick `<ACTION>...</ACTION>`
-            ai_reply = re.sub(r"`+[^`]*</?ACTION>[^`]*`+", "", ai_reply, flags=re.DOTALL | re.IGNORECASE)
-            # Nuke mọi <ACTION>, </ACTION>, ＜ACTION＞, ＜/ACTION＞ còn sót
-            ai_reply = re.sub(r"[＜<]\s*/?ACTION\s*[＞>]", "", ai_reply, flags=re.IGNORECASE)
-            # Dọn JSON action rác trơ trọi cuối msg (không có thẻ bao)
-            ai_reply = re.sub(r'\s*\{"type"\s*:\s*"[a-z_]+"[^}]*\}\s*$', "", ai_reply)
-            # Dọn JSON action rác ở bất kỳ đâu nếu nó nằm một mình trên 1 dòng
-            ai_reply = re.sub(r'^\s*\{"type"\s*:\s*"[a-z_]+"[^}]*\}\s*$', "", ai_reply, flags=re.MULTILINE)
-            # FINAL SAFETY NET: str.replace() — không regex, không thể sai
-            for _tag in ("<ACTION>", "</ACTION>", "<action>", "</action>",
-                         "< ACTION>", "< /ACTION>", "<ACTION >", "</ACTION >",
-                         "＜ACTION＞", "＜/ACTION＞"):
-                ai_reply = ai_reply.replace(_tag, "")
-            ai_reply = ai_reply.strip()
+            # FALLBACK CHỦ ĐỘNG CHO SẾP PHÁT / VIP:
+            # Nếu AI quên output JSON hoặc chỉ output </ACTION>, nhưng câu lệnh rõ ràng là giao/nhắc task:
+            if not action_json_str and authorized:
+                task_keywords = (
+                    "nhắc task", "giao task", "giao việc", "assign task",
+                    "nhắc việc", "nhắc nhở task", "đòi task", "nhắc lại task",
+                    "nhắc làm", "nhắc check task"
+                )
+                if any(kw in lower_text for kw in task_keywords):
+                    task_content = user_text
+                    for kw in task_keywords:
+                        if kw in task_content.lower():
+                            parts = re.split(re.escape(kw), task_content, flags=re.IGNORECASE)
+                            if len(parts) > 1 and parts[1].strip():
+                                task_content = parts[1].strip()
+                            break
+                    task_content = re.sub(r"^(lại\s+)?cho\s+", "", task_content, flags=re.IGNORECASE).strip()
+                    task_content = re.sub(r"\s+đi\s+(boss|em|anh).*$", "", task_content, flags=re.IGNORECASE).strip()
+                    # Lọc sạch tên/mention của thành viên ra khỏi nội dung task để không bị lặp
+                    for m in message.mentions:
+                        task_content = task_content.replace(f"@{m.display_name}", "").replace(f"@{m.name}", "").replace(f"<@{m.id}>", "").replace(f"<@!{m.id}>", "")
+                    for r in message.role_mentions:
+                        task_content = task_content.replace(f"@{r.name}", "").replace(f"<@&{r.id}>", "")
+                    task_content = task_content.strip(" :,.-")
+                    action_json_str = json.dumps({
+                        "type": "assign_task",
+                        "task": task_content or "Kiểm tra và hoàn thành tiến độ công việc"
+                    })
+
+            # ========== CLEANUP: xoá MỌI dấu vết ACTION khỏi tin nhắn ==========
+            ai_reply = _strip_action_tags(raw_ai_reply)
 
             if action_json_str and authorized:
                 try:
@@ -1629,6 +1675,9 @@ async def on_message(message: discord.Message) -> None:
             if action_status_note and action_status_note.startswith("⚠️"):
                 # Chỉ hiện khi LỖI — thành công thì ngầm, AI đã rep tự nhiên rồi
                 ai_reply = f"{ai_reply}\n\n{action_status_note}".strip()
+
+            # Chốt hạ: Luôn lọc sạch mọi vết tích ACTION một lần nữa trước khi gửi
+            ai_reply = _strip_action_tags(ai_reply)
 
             history_user_entry = full_user_prompt
             if image_data_urls:
