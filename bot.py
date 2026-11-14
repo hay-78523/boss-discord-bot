@@ -1485,18 +1485,54 @@ def _save_tasks(tasks: Dict[str, Any]) -> None:
     TASK_TABLE.save(tasks)
 
 
+def _load_service_account_info() -> Dict[str, Any]:
+    """Tìm key Service Account: biến GOOGLE_SERVICE_ACCOUNT_JSON (nội dung hoặc đường dẫn),
+    GOOGLE_SERVICE_ACCOUNT_FILE, rồi tới các vị trí mặc định (Secret File của Render, thư mục bot)."""
+    raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    candidates: List[str] = []
+    if raw_json.startswith("{"):
+        try:
+            return json.loads(raw_json)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"GOOGLE_SERVICE_ACCOUNT_JSON không phải JSON hợp lệ (dán thiếu?): {exc}") from exc
+    if raw_json:
+        candidates.append(raw_json)  # điền nhầm đường dẫn file vào biến JSON
+    for path in (
+        os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip(),
+        "/etc/secrets/boss-service-account.json",
+        str(Path(__file__).parent / "boss-service-account.json"),
+    ):
+        if path and path not in candidates:
+            candidates.append(path)
+
+    problems: List[str] = []
+    for path in candidates:
+        file_path = Path(path)
+        if not file_path.is_file():
+            problems.append(f"{path}: không tồn tại")
+            continue
+        content = file_path.read_text(encoding="utf-8-sig").strip()
+        if not content:
+            problems.append(f"{path}: file trống")
+            continue
+        try:
+            info = json.loads(content)
+        except json.JSONDecodeError as exc:
+            problems.append(f"{path}: không phải JSON hợp lệ ({exc}), bắt đầu bằng {content[:12]!r}")
+            continue
+        if info.get("type") != "service_account" or "private_key" not in info:
+            problems.append(f"{path}: không phải key Service Account")
+            continue
+        logger.info("Dùng key Service Account từ %s (%s)", path, info.get("client_email"))
+        return info
+    raise RuntimeError("Không tìm được key Service Account hợp lệ — " + "; ".join(problems))
+
+
 def _open_worksheets_sync() -> None:
     """Kết nối Google Sheet bằng Service Account và mở (hoặc tạo) từng tab."""
     import gspread
 
-    raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-    key_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
-    if raw_json:
-        gc = gspread.service_account_from_dict(json.loads(raw_json))
-    elif key_file:
-        gc = gspread.service_account(filename=key_file)
-    else:
-        raise RuntimeError("Thiếu GOOGLE_SERVICE_ACCOUNT_JSON hoặc GOOGLE_SERVICE_ACCOUNT_FILE")
+    gc = gspread.service_account_from_dict(_load_service_account_info())
     spreadsheet = gc.open_by_key(TASK_SHEET_ID)
     for table in SHEET_TABLES:
         try:
